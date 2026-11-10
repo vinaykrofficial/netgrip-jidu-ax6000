@@ -156,10 +156,13 @@ if [ -d /www/luci-static ]; then
   rm -f /tmp/luci-indexcache* 2>/dev/null || true
 fi
 
+if [ -f /etc/init.d/netgrip.apk-new ]; then
+  mv /etc/init.d/netgrip.apk-new /etc/init.d/netgrip
+fi
 if [ -f /etc/init.d/netgrip ]; then
-  sed -i -e 's/\r$//' /etc/init.d/netgrip 2>/dev/null || true
+  tr -d '\r' < /etc/init.d/netgrip > /tmp/netgrip.clean && mv /tmp/netgrip.clean /etc/init.d/netgrip
   chmod 755 /etc/init.d/netgrip
-  /etc/init.d/netgrip enable || die 5 "could not enable the service"
+  /etc/init.d/netgrip enable 2>/dev/null || true
   /etc/init.d/netgrip restart || die 5 "service failed to start; check with: logread | grep netgrip"
 else
   die 5 "package installed but /etc/init.d/netgrip is missing"
