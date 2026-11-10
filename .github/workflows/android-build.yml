@@ -1,0 +1,59 @@
+name: Android App Build & Release
+
+on:
+  push:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android-build.yml'
+    branches:
+      - main
+  workflow_dispatch:
+  release:
+    types: [published, created]
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Grant Execute Permission for Gradlew
+        run: chmod +x android/gradlew || true
+
+      - name: Build Android Release APK
+        working-directory: android
+        run: |
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Copy & Rename APK
+        run: |
+          mkdir -p output
+          find android/app/build/outputs/apk -name "*.apk" -exec cp {} output/netgrip-jidu-ax6000-release.apk \;
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: netgrip-jidu-ax6000-apk
+          path: output/netgrip-jidu-ax6000-release.apk
+
+      - name: Upload to Release (if release event)
+        if: github.event_name == 'release'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.event.release.tag_name }} output/netgrip-jidu-ax6000-release.apk --clobber

@@ -11,6 +11,17 @@
 
 ---
 
+## 📱 NetGrip Native Android App (Kotlin + Compose)
+
+A complete native Android management application is included in the [`/android`](android/) directory:
+
+- **Technology:** Kotlin 2.0, Jetpack Compose Material 3, Retrofit 2, OkHttp CookieJar.
+- **Features:** Real-time CPU/RAM gauges, 5-Port Ethernet Matrix (2.5G WAN + LAN 1-4), live connected client tracking with signal dBm, Wi-Fi 6 SSID/QR-sharing, WireGuard & AdGuard Home integration, and network ping diagnostics.
+- **CI/CD:** Automatically built into release APKs via GitHub Actions ([`.github/workflows/android-build.yml`](.github/workflows/android-build.yml)).
+- **Documentation:** See the [Android App Guide](android/README.md) for build, installation, and usage instructions.
+
+---
+
 ## 🚀 Router Hardware & Environment Specifications
 
 This build of NetGrip is customized and verified specifically for the **Jidu AX6000 (Model 6411)** router running the [jio-ax6000-openwrt](https://github.com/dexapro-on-lexapro/jio-ax6000-openwrt) snapshot firmware:
