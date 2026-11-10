@@ -156,6 +156,13 @@ if [ -d /www/luci-static ]; then
   rm -f /tmp/luci-indexcache* 2>/dev/null || true
 fi
 
+if command -v uci >/dev/null 2>&1; then
+  uci -q get netgrip.main >/dev/null || uci set netgrip.main=panel
+  uci -q get netgrip.main.port >/dev/null || uci set netgrip.main.port=8090
+  uci -q get netgrip.main.https >/dev/null || uci set netgrip.main.https=0
+  uci commit netgrip 2>/dev/null || true
+fi
+
 if [ -f /etc/init.d/netgrip.apk-new ]; then
   mv /etc/init.d/netgrip.apk-new /etc/init.d/netgrip
 fi
