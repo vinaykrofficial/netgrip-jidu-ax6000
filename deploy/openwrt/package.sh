@@ -79,7 +79,7 @@ Version: ${PKG_VERSION:-0.0.0}-${PKG_RELEASE:-1}
 License: AGPL-3.0-only
 Section: utils
 Architecture: ${PKG_ARCH}
-Maintainer: Nacho <netgrip@cloudless.club>
+Maintainer: Vinay Kumar <kumar.vinay831@gmail.com>
 Description: Lightweight on-router companion panel for OpenWrt
  Simple visual panel that complements LuCI: dashboard plus service
  toggles that deploy real configuration with snapshot and rollback.

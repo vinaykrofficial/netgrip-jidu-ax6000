@@ -15,7 +15,7 @@
 
 set -eu
 
-REPO="gnacho/netgrip"
+REPO="vinaykrofficial/netgrip-jidu-ax6000"
 RELEASES_URL="https://github.com/${REPO}/releases"
 VERSION="${NETGRIP_VERSION:-}"
 ASSET_BASE="${NETGRIP_ASSET_BASE:-}"
@@ -136,6 +136,26 @@ case "$PKGR" in
     ;;
 esac
 
+# Install companion LuCI application if LuCI web interface is installed
+if [ -d /www/luci-static ]; then
+  say "LuCI interface detected, installing luci-app-netgrip companion"
+  if [ "$PKGR" = apk ]; then
+    LUCI_ASSET="luci-app-netgrip-${VER_NUM}-r1.apk"
+    LUCI_URL="${ASSET_BASE%/}/${LUCI_ASSET}"
+    if fetch "$LUCI_URL" "$TMP/$LUCI_ASSET"; then
+      apk add --allow-untrusted "$TMP/$LUCI_ASSET" || true
+    fi
+  else
+    LUCI_ASSET="luci-app-netgrip_${VER_NUM}-1_all.ipk"
+    LUCI_URL="${ASSET_BASE%/}/${LUCI_ASSET}"
+    if fetch "$LUCI_URL" "$TMP/$LUCI_ASSET"; then
+      opkg install "$TMP/$LUCI_ASSET" || true
+    fi
+  fi
+  /etc/init.d/rpcd restart 2>/dev/null || true
+  rm -f /tmp/luci-indexcache* 2>/dev/null || true
+fi
+
 if [ -x /etc/init.d/netgrip ]; then
   /etc/init.d/netgrip enable || die 5 "could not enable the service"
   /etc/init.d/netgrip restart || die 5 "service failed to start; check with: logread | grep netgrip"
@@ -152,7 +172,7 @@ lan_ip() {
   if command -v uci >/dev/null 2>&1; then
     uci -q get network.lan.ipaddr 2>/dev/null && return 0
   fi
-  echo "192.168.1.1"
+  echo "192.168.2.1"
 }
 
 say "done. netgrip $VERSION is running."

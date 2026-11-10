@@ -381,7 +381,7 @@ function ShellInner({ onLogout }: { onLogout: () => void }) {
         <div className="md:hidden flex items-center gap-2">
           <span className="text-accent"><Logo size={22} /></span>
           <span className="text-body font-semibold truncate">
-            NetGrip <span className="text-muted font-normal font-mono text-small">· {board?.hostname ?? "…"}</span>
+            NetGrip <span className="text-muted font-normal font-mono text-small">· {board?.model?.includes("6411") ? "Jidu AX6000" : (board?.hostname ?? "…")}</span>
           </span>
         </div>
         <div className="hidden md:block">
@@ -484,9 +484,12 @@ function ShellInner({ onLogout }: { onLogout: () => void }) {
         <nav aria-label={t("app.name")} className="hidden md:flex md:flex-col md:w-16 lg:w-60 md:shrink-0 md:min-h-screen border-r border-border bg-surface/40 p-2 lg:p-3 sticky top-0 max-h-screen overflow-y-auto">
           <div className="flex items-center gap-2 px-1.5 py-2 mb-2">
             <span className="text-accent shrink-0"><Logo size={26} /></span>
-            <p className="hidden lg:block text-body font-semibold truncate">
-              NetGrip <span className="text-muted font-normal font-mono text-small">· {board?.hostname ?? "…"}</span>
-            </p>
+            <div className="hidden lg:block min-w-0">
+              <p className="text-body font-semibold truncate leading-tight">NetGrip</p>
+              <p className="text-[11px] text-muted font-mono truncate leading-tight">
+                {board?.model?.includes("6411") ? "Jidu AX6000 6411" : (board?.hostname ?? "…")}
+              </p>
+            </div>
           </div>
           {/* Badge de rol (#487): debajo del nombre, solo cuando el rol es
               fiable (caché o probe confirmado); nunca en la versión compacta. */}

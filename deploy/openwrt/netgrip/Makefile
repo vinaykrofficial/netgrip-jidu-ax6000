@@ -13,7 +13,7 @@ define Package/netgrip
 	SECTION:=utils
 	CATEGORY:=Utilities
 	TITLE:=Lightweight on-router companion panel for OpenWrt
-	URL:=https://github.com/gnacho/netgrip
+	URL:=https://github.com/vinaykrofficial/netgrip-jidu-ax6000
 	DEPENDS:=@(aarch64||arm||mips||mipsel||x86_64) +ethtool-full
 endef
 

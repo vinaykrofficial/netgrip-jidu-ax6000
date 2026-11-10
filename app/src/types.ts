@@ -3,6 +3,8 @@ export interface Board {
   hostname: string;
   kernel: string;
   release?: { distribution: string; version: string; revision: string };
+  board_name?: string;
+  system?: string;
 }
 
 export interface SystemInfo {

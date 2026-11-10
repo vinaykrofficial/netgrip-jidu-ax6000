@@ -267,7 +267,7 @@ func SetGatewaySSHForTest(t testT, fn func(command string) (string, error)) {
 // dnsmasq it falls back to the gateway's lease file over SSH.
 func leasesForClients() ([]ubus.Lease, string, error) {
 	leases, _ := ubus.ReadLeases(leasesFilePath)
-	if len(leases) > 0 {
+	if len(leases) > 0 || probeModeFn().Mode != "ap" {
 		return leases, "local", nil
 	}
 	out, err := gatewaySSH("cat /tmp/dhcp.leases")
@@ -399,9 +399,12 @@ func dhcpReservations() map[string]dhcpReservation {
 				}
 			}
 		}
-		if len(res) > 0 {
+		if len(res) > 0 || probeModeFn().Mode != "ap" {
 			return res
 		}
+	}
+	if probeModeFn().Mode != "ap" {
+		return res
 	}
 	// Fallback: parse the gateway's /etc/config/dhcp host blocks.
 	out, err := gatewaySSH("cat /etc/config/dhcp")

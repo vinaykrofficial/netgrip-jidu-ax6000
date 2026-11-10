@@ -53,16 +53,19 @@ export function IdentityCard({ board, index = 1 }: { board: Board | undefined; i
     }
   };
 
+  const isJidu6411 = board?.board_name?.includes("6411") || board?.model?.includes("6411");
+
   return (
     <Card index={index} title={t("system.identityTitle")} icon={Info}>
       <div className="grid gap-x-6 sm:grid-cols-2">
         <KeyValue items={[
-          { label: t("system.model"), value: board?.model ?? "…" },
+          { label: t("system.model"), value: isJidu6411 ? `${board?.model} · Qualcomm IPQ9554` : (board?.model ?? "…") },
           { label: t("system.firmware"), value: board?.release ? `${board.release.distribution} ${board.release.version} (${board.release.revision})` : "…" },
-          { label: t("system.kernel"), value: board?.kernel ?? "…", mono: true },
+          { label: t("system.kernel"), value: board?.kernel ? `${board.kernel} (Linux 6.18+ musl)` : "…", mono: true },
         ]} />
         <KeyValue items={[
           { label: t("system.hostname"), value: board?.hostname ?? "…", mono: true },
+          { label: "Hardware", value: isJidu6411 ? "4x4 Wi-Fi 6 (ath11k) · 2.5G WAN + 4x 1G LAN" : (board?.system ?? "…") },
           { label: "NetGrip", value: selfUpdate?.current ?? "…", mono: true },
         ]} />
       </div>

@@ -1,7 +1,7 @@
 export default {
-  app: { name: "NetGrip" },
+  app: { name: "NetGrip · Jidu AX6000" },
   about: {
-    description: "An open-source companion panel for your OpenWrt router.",
+    description: "An open-source companion panel optimized for Jidu AX6000 (Model 6411 / Qualcomm IPQ9554).",
     project: "Project",
     repository: "Repository",
     website: "Website",

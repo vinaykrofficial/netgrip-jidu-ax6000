@@ -140,7 +140,7 @@ export function EthPortsCard({ ports, index = 0, className = "md:col-span-2" }: 
   };
 
   const portLabel = (p: EthPort) =>
-    p.wan ? "WAN" : p.name.toUpperCase().replace(/^LAN(\d+)$/, "LAN $1");
+    p.wan ? "WAN (2.5G)" : p.name.toUpperCase().replace(/^LAN(\d+)$/, "LAN $1");
 
   const macLine = (p: EthPort) =>
     `${p.devices[0]?.mac ?? ""}${p.up && p.speed_mbps > 0

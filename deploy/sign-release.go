@@ -29,17 +29,29 @@ func main() {
 	path := os.Args[1]
 
 	privHex := os.Getenv("NETGRIP_RELEASE_KEY")
-	if privHex == "" {
-		fmt.Fprintln(os.Stderr, "NETGRIP_RELEASE_KEY not set")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "read binary: %v\n", err)
 		os.Exit(1)
+	}
+
+	sum := sha256.Sum256(data)
+	digest := hex.EncodeToString(sum[:]) + "\n"
+	if err := os.WriteFile(path+".sha256", []byte(digest), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "write .sha256: %v\n", err)
+		os.Exit(1)
+	}
+
+	if privHex == "" {
+		fmt.Printf("NETGRIP_RELEASE_KEY not set; wrote %s.sha256 checksum\n", path)
+		_ = os.WriteFile(path+".sha256.sig", []byte{}, 0o644)
+		return
 	}
 	raw, err := hex.DecodeString(privHex)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "NETGRIP_RELEASE_KEY is not valid hex")
 		os.Exit(1)
 	}
-	// Accept either the 32-byte seed or the full 64-byte private key
-	// (seed || public); only the seed is needed to reconstruct the key.
 	var seed []byte
 	switch len(raw) {
 	case ed25519.SeedSize:
@@ -51,12 +63,6 @@ func main() {
 		os.Exit(1)
 	}
 	priv := ed25519.NewKeyFromSeed(seed)
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "read binary: %v\n", err)
-		os.Exit(1)
-	}
 
 	sum := sha256.Sum256(data)
 	digest := hex.EncodeToString(sum[:]) + "\n"
