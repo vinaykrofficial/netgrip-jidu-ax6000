@@ -1,6 +1,8 @@
 /internal/server/dist/
 /app/node_modules/
-/dist/
+/dist/*
+!/dist/packages/
+/dist/packages/netgrip-linux-arm64
 /owpanel
 *.test
 /app/tsconfig.tsbuildinfo
