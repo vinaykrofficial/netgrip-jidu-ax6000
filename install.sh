@@ -156,7 +156,9 @@ if [ -d /www/luci-static ]; then
   rm -f /tmp/luci-indexcache* 2>/dev/null || true
 fi
 
-if [ -x /etc/init.d/netgrip ]; then
+if [ -f /etc/init.d/netgrip ]; then
+  sed -i -e 's/\r$//' /etc/init.d/netgrip 2>/dev/null || true
+  chmod 755 /etc/init.d/netgrip
   /etc/init.d/netgrip enable || die 5 "could not enable the service"
   /etc/init.d/netgrip restart || die 5 "service failed to start; check with: logread | grep netgrip"
 else
