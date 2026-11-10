@@ -58,11 +58,18 @@ fun DiagnosticsScreen(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    listOf("ping" to "Ping", "traceroute" to "Traceroute", "nslookup" to "DNS Lookup").forEach { (id, label) ->
+                    listOf("ping" to "Ping", "traceroute" to "Traceroute", "dns" to "DNS Lookup").forEach { (id, label) ->
                         val isSelected = selectedTool == id
                         FilterChip(
                             selected = isSelected,
-                            onClick = { selectedTool = id },
+                            onClick = {
+                                selectedTool = id
+                                if (id == "dns" && (targetHost.startsWith("1.") || targetHost.startsWith("8.") || targetHost.startsWith("192."))) {
+                                    targetHost = "google.com"
+                                } else if (id != "dns" && targetHost.contains("google.com")) {
+                                    targetHost = "1.1.1.1"
+                                }
+                            },
                             label = { Text(label, fontSize = 12.sp, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal) },
                             colors = FilterChipDefaults.filterChipColors(
                                 selectedContainerColor = CyanAccent,
@@ -80,7 +87,7 @@ fun DiagnosticsScreen(
                 OutlinedTextField(
                     value = targetHost,
                     onValueChange = { targetHost = it },
-                    label = { Text("Target Host / IP") },
+                    label = { Text(if (selectedTool == "dns") "Domain / Hostname to Resolve" else "Target Host / IP") },
                     singleLine = true,
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = CyanAccent,
@@ -98,7 +105,12 @@ fun DiagnosticsScreen(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    listOf("1.1.1.1", "8.8.8.8", "192.168.2.1").forEach { preset ->
+                    val presets = if (selectedTool == "dns") {
+                        listOf("google.com", "cloudflare.com", "openwrt.org")
+                    } else {
+                        listOf("1.1.1.1", "8.8.8.8", "192.168.2.1")
+                    }
+                    presets.forEach { preset ->
                         AssistChip(
                             onClick = { targetHost = preset },
                             label = { Text(preset, fontSize = 11.sp, color = CyanAccent) }

@@ -121,10 +121,10 @@ class RouterViewModel(
     fun runDiagnostics(tool: String, host: String) {
         val url = _uiState.value.routerUrl
         viewModelScope.launch {
-            _uiState.update { it.copy(isDiagRunning = true, diagOutput = "Running $tool on $host...") }
+            _uiState.update { it.copy(isDiagRunning = true, diagOutput = "Executing $tool on $host...") }
             val res = repository.runDiagnostics(url, tool, host)
             if (res.isSuccess) {
-                _uiState.update { it.copy(isDiagRunning = false, diagOutput = res.getOrNull()?.output ?: "No output") }
+                _uiState.update { it.copy(isDiagRunning = false, diagOutput = res.getOrDefault("No output received")) }
             } else {
                 _uiState.update {
                     it.copy(

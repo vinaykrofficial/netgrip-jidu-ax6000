@@ -39,7 +39,7 @@ interface NetGripApiService {
     suspend fun getWireGuard(): WireGuardStatus
 
     @POST("/api/diagnostics")
-    suspend fun runDiagnostics(@Body request: DiagnosticsRequest): DiagnosticsResult
+    suspend fun runDiagnostics(@Body request: DiagnosticsRequest): okhttp3.ResponseBody
 
     @POST("/api/reboot")
     suspend fun rebootRouter(): Response<Unit>

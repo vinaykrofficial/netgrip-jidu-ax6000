@@ -151,8 +151,11 @@ data class WireGuardPeer(
 
 // --- Diagnostics ---
 data class DiagnosticsRequest(
-    @SerializedName("tool") val tool: String, // "ping", "traceroute", "nslookup"
-    @SerializedName("host") val host: String
+    @SerializedName("test") val test: String, // "ping", "traceroute", "dns"
+    @SerializedName("host") val host: String? = null,
+    @SerializedName("count") val count: Int? = null,
+    @SerializedName("query") val query: String? = null,
+    @SerializedName("resolver") val resolver: String? = null
 )
 
 data class DiagnosticsResult(
