@@ -1,0 +1,7 @@
+*.gz binary
+*.png binary
+*.webp binary
+*.apk binary
+*.ipk binary
+*.pub binary
+* text=auto eol=lf
