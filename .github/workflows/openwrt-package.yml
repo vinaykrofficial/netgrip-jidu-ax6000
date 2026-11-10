@@ -1,0 +1,398 @@
+name: openwrt-package
+
+# Builds the frontend once, fans it into seven generic Go ABI binaries, then
+# packages those binaries with the OpenWrt 24.10 (.ipk) and 25.12 (.apk) SDKs.
+#
+# Triggered on v* tag pushes only: every release path (CLI, UI, workflow)
+# creates the tag, and the tag push is the one event that always fires
+# even when the release is published by another workflow with GITHUB_TOKEN
+# (release events are not). The workflow creates the release itself when
+# missing, so it needs no assets waiting. A concurrency group serializes
+# any residual double-fire for the same tag so uploads never race (#214).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag (e.g. v0.1.6)'
+        required: true
+
+concurrency:
+  group: openwrt-package-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          # Los jobs de empaquetado suben en paralelo: la release debe existir
+          # ANTES (antes se creaba a mano y el primer job en llegar moría 404).
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --generate-notes
+
+  frontend:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Build frontend once
+        working-directory: app
+        run: npm ci && npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: internal/server/dist/
+          if-no-files-found: error
+
+  binaries:
+    needs: [create-release, frontend]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - linux-amd64
+          - linux-arm64
+          - linux-armv7
+          - linux-armv6
+          - linux-armv5
+          - linux-mipsle
+          - linux-mips
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: internal/server/dist
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: Build ${{ matrix.target }}
+        env:
+          VERSION: ${{ needs.create-release.outputs.tag }}
+        run: sh deploy/build-binaries.sh "${{ matrix.target }}"
+      - name: Sign binary
+        env:
+          NETGRIP_RELEASE_KEY: ${{ secrets.NETGRIP_RELEASE_KEY }}
+        run: go run deploy/sign-release.go "dist/netgrip-${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: netgrip-binary-${{ matrix.target }}
+          path: dist/netgrip-${{ matrix.target }}
+          if-no-files-found: error
+      - name: Upload binary to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.create-release.outputs.tag }}
+        run: |
+          gh release upload "$TAG" "dist/netgrip-${{ matrix.target }}" --clobber
+          gh release upload "$TAG" "dist/netgrip-${{ matrix.target }}.sha256" "dist/netgrip-${{ matrix.target }}.sha256.sig" --clobber
+
+  size-report:
+    needs: [frontend, binaries]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: netgrip-binary-*
+          path: binaries
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend
+      - name: Write size report
+        run: |
+          frontend_bytes=$(find frontend -type f -printf '%s\n' | awk '{ total += $1 } END { print total + 0 }')
+          human() { numfmt --to=iec --suffix=B "$1"; }
+          {
+            echo "## Release size report"
+            echo
+            echo "| Asset | Go/server | Frontend | Total |"
+            echo "| --- | ---: | ---: | ---: |"
+            for binary in binaries/netgrip-linux-*; do
+              total_bytes=$(stat -c %s "$binary")
+              core_bytes=$((total_bytes - frontend_bytes))
+              echo "| $(basename "$binary") | $(human "$core_bytes") | $(human "$frontend_bytes") | $(human "$total_bytes") |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  package:
+    needs: [create-release, binaries]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sdk-version: 24.10.5
+            sdk-target: qualcommax/ipq807x
+            format: ipk
+            binary: linux-arm64
+            pkgarch: aarch64_cortex-a53
+          - sdk-version: 25.12.5
+            sdk-target: qualcommax/ipq807x
+            format: apk
+            binary: linux-arm64
+            pkgarch: aarch64_cortex-a53
+          - sdk-version: 24.10.5
+            sdk-target: x86/64
+            format: ipk
+            binary: linux-amd64
+            pkgarch: x86_64
+          - sdk-version: 25.12.5
+            sdk-target: x86/64
+            format: apk
+            binary: linux-amd64
+            pkgarch: x86_64
+          - sdk-version: 24.10.5
+            sdk-target: ramips/mt7621
+            format: ipk
+            binary: linux-mipsle
+            pkgarch: mipsel_24kc
+          - sdk-version: 25.12.5
+            sdk-target: ramips/mt7621
+            format: apk
+            binary: linux-mipsle
+            pkgarch: mipsel_24kc
+          - sdk-version: 24.10.5
+            sdk-target: ath79/generic
+            format: ipk
+            binary: linux-mips
+            pkgarch: mips_24kc
+          - sdk-version: 25.12.5
+            sdk-target: ath79/generic
+            format: apk
+            binary: linux-mips
+            pkgarch: mips_24kc
+          - sdk-version: 24.10.5
+            sdk-target: ipq40xx/generic
+            format: ipk
+            binary: linux-armv7
+            pkgarch: arm_cortex-a7_neon-vfpv4
+          - sdk-version: 25.12.5
+            sdk-target: ipq40xx/generic
+            format: apk
+            binary: linux-armv7
+            pkgarch: arm_cortex-a7_neon-vfpv4
+          - sdk-version: 24.10.5
+            sdk-target: bcm27xx/bcm2708
+            format: ipk
+            binary: linux-armv6
+            pkgarch: arm_arm1176jzf-s_vfp
+          - sdk-version: 25.12.5
+            sdk-target: bcm27xx/bcm2708
+            format: apk
+            binary: linux-armv6
+            pkgarch: arm_arm1176jzf-s_vfp
+          - sdk-version: 24.10.5
+            sdk-target: kirkwood/generic
+            format: ipk
+            binary: linux-armv5
+            pkgarch: arm_xscale
+          - sdk-version: 25.12.5
+            sdk-target: kirkwood/generic
+            format: apk
+            binary: linux-armv5
+            pkgarch: arm_xscale
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: netgrip-binary-${{ matrix.binary }}
+          path: /tmp/netgrip-binary
+
+      - name: Package ${{ matrix.format }} (SDK ${{ matrix.sdk-version }})
+        env:
+          TAG: ${{ needs.create-release.outputs.tag }}
+          PKG_ARCH: ${{ matrix.pkgarch }}
+        run: |
+          chmod +x deploy/openwrt/package.sh
+          export PKG_VERSION="${TAG#v}"
+          export PKG_RELEASE="1"
+          deploy/openwrt/package.sh \
+            "${{ matrix.sdk-version }}" \
+            "${{ matrix.sdk-target }}" \
+            "" \
+            "${{ matrix.format }}" \
+            "/tmp/netgrip-binary/netgrip-${{ matrix.binary }}"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.create-release.outputs.tag }}
+        run: |
+          echo "Packages generated:"
+          ls -la dist/packages/
+          # The SDK selects the exact package architecture; the release suffix
+          # identifies the generic Go ABI binary carried by the package.
+          for apk in dist/packages/*.apk; do
+            [ -f "$apk" ] || continue
+            base="$(basename "$apk" .apk)"
+            asset_arch="${{ matrix.binary }}"
+            asset_arch="${asset_arch#linux-}"
+            newname="${base}-${asset_arch}.apk"
+            mv "$apk" "dist/packages/$newname"
+            echo "Renamed: $newname"
+          done
+          gh release upload "$TAG" dist/packages/*.${{ matrix.format }} --clobber
+
+  package-luci:
+    needs: create-release
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sdk-version: 24.10.5
+            sdk-target: qualcommax/ipq807x
+            format: ipk
+          - sdk-version: 25.12.5
+            sdk-target: qualcommax/ipq807x
+            format: apk
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package luci-app ${{ matrix.format }} (SDK ${{ matrix.sdk-version }})
+        env:
+          TAG: ${{ needs.create-release.outputs.tag }}
+        run: |
+          chmod +x deploy/openwrt/package-luci.sh
+          export PKG_VERSION="${TAG#v}"
+          export PKG_RELEASE="1"
+          deploy/openwrt/package-luci.sh \
+            "${{ matrix.sdk-version }}" \
+            "${{ matrix.sdk-target }}" \
+            "" \
+            "${{ matrix.format }}"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.create-release.outputs.tag }}
+        run: |
+          echo "LuCI packages generated:"
+          ls -la dist/packages/
+          gh release upload "$TAG" dist/packages/*.${{ matrix.format }} --clobber
+
+  apk-feed:
+    needs: [package, package-luci]
+    runs-on: ubuntu-24.04
+    container:
+      # apk index needs apk-tools 3.x to read OpenWrt 25 .apk packages;
+      # alpine:3.21 ships 2.14 and fails every package with IO ERROR (#296).
+      image: alpine:edge
+    if: github.event_name != 'workflow_dispatch' || inputs.version != ''
+    permissions:
+      contents: write
+      pages: write
+    steps:
+      - name: Install dependencies
+        run: |
+          apk add --no-cache git nodejs npm openssl curl github-cli zstd tar bash
+
+      - uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download APKs from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          mkdir -p feed
+          cd feed
+          gh release download "$TAG" --repo ${{ github.repository }} --pattern '*.apk'
+          cd ..
+          ls -la feed/
+
+      - name: Set up signing key
+        env:
+          NETGRIP_FEED_KEY: ${{ secrets.NETGRIP_FEED_KEY }}
+        run: |
+          if [ -z "$NETGRIP_FEED_KEY" ]; then
+            echo "::error::NETGRIP_FEED_KEY secret not set. Generate a key with:"
+            echo "::error::  usign -G -s netgrip-feed-sec -p deploy/openwrt/keys/netgrip-feed.pub"
+            echo "::error::Then add the secret key content as NETGRIP_FEED_KEY in repo secrets."
+            exit 1
+          fi
+          mkdir -p ~/.abuild
+          echo "$NETGRIP_FEED_KEY" > ~/.abuild/netgrip-feed-sec
+          chmod 600 ~/.abuild/netgrip-feed-sec
+
+      - name: Sign APKs and generate index
+        run: |
+          chmod +x deploy/openwrt/sign-apk.sh
+          # The feed index must be built with the OpenWrt apk-tools: the
+          # Alpine one (also 3.x) speaks a different package format and
+          # fails on every apk with "file format not supported" (#296).
+          SDK_URL_DIR="https://downloads.openwrt.org/releases/25.12.5/targets/x86/64/"
+          SDK_NAME="$(curl -fsSL "$SDK_URL_DIR" | grep -o 'openwrt-sdk-[^"]*\.tar\.zst' | head -1)"
+          curl -fsSL "${SDK_URL_DIR}${SDK_NAME}" -o sdk.tar.zst
+          tar --zstd -xf sdk.tar.zst
+          export PATH="${PWD}/${SDK_NAME%.tar.zst}/staging_dir/host/bin:$PATH"
+          ./deploy/openwrt/sign-apk.sh feed ~/.abuild/netgrip-feed-sec deploy/openwrt/keys/netgrip-feed.pub
+
+      - name: Upload feed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-feed
+          path: feed/
+
+  deploy-feed:
+    needs: apk-feed
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pages: write
+    steps:
+      - name: Download feed artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: apk-feed
+          path: feed/
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./feed
+          publish_branch: gh-pages
+          force_push: true

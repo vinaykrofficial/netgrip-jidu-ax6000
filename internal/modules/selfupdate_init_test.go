@@ -1,0 +1,298 @@
+package modules
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// useTempInitScript points initScriptPath at a file inside a t.TempDir()
+// and restores it on cleanup.
+func useTempInitScript(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "netgrip")
+	old := initScriptPath
+	initScriptPath = path
+	t.Cleanup(func() { initScriptPath = old })
+	return path
+}
+
+// TestSelfUpdateSyncInitRewritesStaleManaged: an init script that is ours
+// (marker present) but differs from the embedded one is rewritten and the
+// old content lands in a versioned backup (#433).
+func TestSelfUpdateSyncInitRewritesStaleManaged(t *testing.T) {
+	path := useTempInitScript(t)
+
+	stale := []byte("#!/bin/sh /etc/rc.common\n" + initMarker + "\n# old version without https flags\n")
+	if err := os.WriteFile(path, stale, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	syncInitScript("v0.72.0")
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := canonicalInitScript()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("init script not rewritten to embedded canonical:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+
+	backup, err := os.ReadFile(path + ".bak-0.72.0")
+	if err != nil {
+		t.Fatalf("backup not created: %v", err)
+	}
+	if !bytes.Equal(backup, stale) {
+		t.Errorf("backup does not hold the previous content:\n%s", backup)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&0111 == 0 {
+		t.Errorf("rewritten init script lost its executable bit: %v", info.Mode())
+	}
+}
+
+// TestSelfUpdateSyncInitKeepsCustomScript: a personalized script without
+// our marker must be left untouched (#433).
+func TestSelfUpdateSyncInitKeepsCustomScript(t *testing.T) {
+	path := useTempInitScript(t)
+
+	custom := []byte("#!/bin/sh /etc/rc.common\n# hand-written local tweaks\nexit 0\n")
+	if err := os.WriteFile(path, custom, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	syncInitScript("v0.72.0")
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, custom) {
+		t.Errorf("custom init script was modified:\n%s", got)
+	}
+	if _, err := os.Stat(path + ".bak-0.72.0"); !os.IsNotExist(err) {
+		t.Errorf("backup created for a custom script, err=%v", err)
+	}
+}
+
+// TestSelfUpdateSyncInitInstallsMissing: with no init script at all (the
+// binary was installed by hand, outside any package), it is installed.
+func TestSelfUpdateSyncInitInstallsMissing(t *testing.T) {
+	path := useTempInitScript(t)
+
+	syncInitScript("v0.72.0")
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("init script not installed: %v", err)
+	}
+	want, err := canonicalInitScript()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("installed init script differs from embedded canonical")
+	}
+}
+
+// TestSelfUpdateSyncInitIdempotent: running the sync twice must not
+// rewrite an already-current script (mtime stays, no pointless backups).
+func TestSelfUpdateSyncInitIdempotent(t *testing.T) {
+	path := useTempInitScript(t)
+
+	syncInitScript("v0.72.0")
+	first, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	syncInitScript("v0.72.0")
+	second, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.ModTime().Equal(second.ModTime()) {
+		t.Errorf("unchanged init script was rewritten (mtime changed)")
+	}
+	if entries, _ := filepath.Glob(path + ".bak-*"); len(entries) > 0 {
+		t.Errorf("unexpected backups for an up-to-date script: %v", entries)
+	}
+}
+
+// TestSelfUpdateSyncInitHealsLegacyPackagedScript: a script shipped by the
+// package before the managed marker existed carries no marker, but matching
+// a known packaged variant byte-for-byte proves it is ours, so it is
+// rewritten like any other stale managed script (#492).
+func TestSelfUpdateSyncInitHealsLegacyPackagedScript(t *testing.T) {
+	entries, err := legacyInitFS.ReadDir("selfupdate_init/legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		t.Run(entry.Name(), func(t *testing.T) {
+			path := useTempInitScript(t)
+
+			legacy, err := legacyInitFS.ReadFile("selfupdate_init/legacy/" + entry.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, legacy, 0755); err != nil {
+				t.Fatal(err)
+			}
+
+			syncInitScript("v0.72.0")
+
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := canonicalInitScript()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Errorf("legacy packaged init script not rewritten to embedded canonical:\n--- got ---\n%s", got)
+			}
+			if _, err := os.Stat(path + ".bak-0.72.0"); err != nil {
+				t.Errorf("backup not created for legacy packaged script: %v", err)
+			}
+		})
+	}
+}
+
+// TestSelfUpdateSyncInitKeepsTweakedLegacyScript: a legacy package script
+// with a local edit no longer byte-matches any packaged variant, so it is
+// treated like any other customized script and left untouched (#492).
+func TestSelfUpdateSyncInitKeepsTweakedLegacyScript(t *testing.T) {
+	path := useTempInitScript(t)
+
+	legacy, err := legacyInitFS.ReadFile("selfupdate_init/legacy/netgrip-v3.init")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tweaked := append([]byte("#!/bin/sh /etc/rc.common\n# local tweak\n"), legacy...)
+	if err := os.WriteFile(path, tweaked, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	syncInitScript("v0.72.0")
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, tweaked) {
+		t.Errorf("tweaked legacy init script was modified:\n%s", got)
+	}
+}
+
+// TestSelfUpdateEmbeddedInitMatchesPackaged guards the single source of
+// truth: the embedded copy must stay byte-identical to the init script the
+// apk/ipk package ships.
+func TestSelfUpdateEmbeddedInitMatchesPackaged(t *testing.T) {
+	packaged, err := os.ReadFile("../../deploy/openwrt/netgrip/files/netgrip.init")
+	if err != nil {
+		t.Skipf("packaged init script not reachable from test dir: %v", err)
+	}
+	embedded, err := canonicalInitScript()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(packaged, embedded) {
+		t.Errorf("embedded init script diverged from deploy/openwrt/netgrip/files/netgrip.init;\nrefresh internal/modules/selfupdate_init/netgrip.init")
+	}
+}
+
+// useTempOpenWrtRelease points openwrtReleasePath at a file inside a
+// t.TempDir() (created only when present) and restores it on cleanup.
+func useTempOpenWrtRelease(t *testing.T, present bool) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "openwrt_release")
+	if present {
+		if err := os.WriteFile(path, []byte("DISTRIB_ID='OpenWrt'\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := openwrtReleasePath
+	openwrtReleasePath = path
+	t.Cleanup(func() { openwrtReleasePath = old })
+}
+
+// TestBootSyncHealsLegacyPackagedScript: the startup sync behaves like the
+// self-update one, healing a pristine legacy packaged script so a device
+// that only ever got manually copied binaries converges too (#544).
+func TestBootSyncHealsLegacyPackagedScript(t *testing.T) {
+	useTempOpenWrtRelease(t, true)
+	path := useTempInitScript(t)
+
+	entries, err := legacyInitFS.ReadDir("selfupdate_init/legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("no legacy init scripts embedded")
+	}
+	legacy, err := legacyInitFS.ReadFile("selfupdate_init/legacy/" + entries[0].Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, legacy, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	SyncInitScriptAtBoot("v0.76.99")
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := canonicalInitScript()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("startup sync did not heal the legacy packaged script:\n--- got ---\n%s", got)
+	}
+}
+
+// TestBootSyncSkipsOffRouter: without /etc/openwrt_release (dev machine,
+// demo mode) the startup sync must not create or rewrite anything.
+func TestBootSyncSkipsOffRouter(t *testing.T) {
+	useTempOpenWrtRelease(t, false)
+	path := useTempInitScript(t)
+
+	legacy, err := legacyInitFS.ReadFile("selfupdate_init/legacy/" + "netgrip-v1.init")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, legacy, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	SyncInitScriptAtBoot("v0.76.99")
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, legacy) {
+		t.Errorf("off-router startup sync rewrote the init script")
+	}
+	if _, err := os.Stat(path + ".bak-0.76.99"); !os.IsNotExist(err) {
+		t.Errorf("off-router startup sync created a backup: %v", err)
+	}
+}

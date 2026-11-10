@@ -1,0 +1,7 @@
+/internal/server/dist/
+/app/node_modules/
+/dist/
+/owpanel
+*.test
+/app/tsconfig.tsbuildinfo
+/netgrip

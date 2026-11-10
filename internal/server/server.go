@@ -1,0 +1,3564 @@
+package server
+
+import (
+	"bytes"
+	"compress/gzip"
+	"embed"
+	"encoding/json"
+	"fmt"
+	"io"
+	"io/fs"
+	"log"
+	"mime"
+	"net"
+	"net/http"
+	"path"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gnacho/netgrip/internal/auth"
+	"github.com/gnacho/netgrip/internal/executor"
+	"github.com/gnacho/netgrip/internal/mcp"
+	"github.com/gnacho/netgrip/internal/modules"
+	"github.com/gnacho/netgrip/internal/ubus"
+)
+
+//go:embed all:dist
+var distFS embed.FS
+
+// The session cookie has one name per transport, and neither of them is the
+// name it used to have.
+//
+// A browser will not let an insecure origin overwrite a cookie marked Secure
+// ("leave secure cookies alone", RFC 6265bis 5.4). With a single name,
+// turning HTTPS off left the old Secure cookie blocking the new one: the
+// login got the password right, the server sent its cookie, the browser
+// silently discarded it, and the panel came straight back to the login form
+// with nothing anywhere saying why.
+//
+// Two names fix that going forward, but only if NEITHER is the old one. A
+// name that has ever been set with Secure is unusable from HTTP for as long
+// as that cookie lives, and no server can clear it - the same rule that
+// blocks the overwrite blocks the deletion. So the plaintext cookie is
+// renamed too, and legacySessionCookie is read but never written: a session
+// that predates this survives, and is moved onto the right name on its next
+// request.
+const (
+	// httpSessionCookie: served over plain HTTP. Named for its transport so
+	// it cannot collide with a cookie some HTTPS origin set earlier.
+	httpSessionCookie = "netgrip_http_session"
+
+	// secureSessionCookie: served over TLS. The __Secure- prefix makes the
+	// browser refuse it if it ever arrives without Secure or over HTTP.
+	secureSessionCookie = "__Secure-netgrip_session"
+
+	// legacySessionCookie: what both used to be called. Accepted on the way
+	// in, never issued.
+	legacySessionCookie = "netgrip_session"
+
+	leasesPath = "/tmp/dhcp.leases"
+)
+
+type Server struct {
+	rpcdURL string
+	version string
+	// servingCert: the path of the pair this process actually opened, empty
+	// when it is not serving TLS. Configured and served need not agree -
+	// the configured pair can be missing and the listener falls back to
+	// another - and the card has to be able to say which is which.
+	//
+	// Written once, at construction: it used to have a setter called after
+	// New, which left an exported writer for a field the handlers read with
+	// nothing enforcing the order.
+	servingCert string
+	// secure: the panel is served over TLS, so the session cookie carries
+	// the Secure flag. Passed in from startup rather than deduced from the
+	// request: behind a proxy r.TLS is nil and the cookie would go out
+	// without the flag exactly where it is needed most.
+	secure  bool
+	mux     *http.ServeMux
+	mu      sync.Mutex
+	revoked map[string]bool
+	// started feeds the MCP server_status uptime. Set once at construction.
+	started time.Time
+	// logins slows password guessing. The panel's login takes the
+	// router's root password and had no rate limit at all.
+	logins *loginThrottle
+	// confirmMu guards confirm, the single pending apply-rollback window
+	// (connectivity-risky changes with a revert timer). See confirm.go.
+	confirmMu sync.Mutex
+	confirm   *confirmEntry
+}
+
+// New builds the panel. secure says it will be served over TLS, and
+// servingCert is the pair that was opened for it.
+func New(rpcdURL, version string, secure bool, servingCert string) *Server {
+	s := &Server{
+		rpcdURL:     rpcdURL,
+		version:     version,
+		servingCert: servingCert,
+		logins:      newLoginThrottle(),
+		secure:      secure,
+		mux:         http.NewServeMux(),
+		revoked:     make(map[string]bool),
+		started:     time.Now(),
+	}
+	mcpServer := mcp.New(mcp.Deps{Version: version, Started: s.started})
+	s.mux.Handle("/mcp", mcpServer.Handler())
+	s.mux.HandleFunc("/", s.handleSPA)
+	s.mux.HandleFunc("POST /api/login", s.handleLogin)
+	s.mux.HandleFunc("GET /api/me", s.requireAuth(s.handleMe))
+	s.mux.HandleFunc("POST /api/logout", s.handleLogout)
+	s.mux.HandleFunc("GET /api/board", s.requireAuth(s.handleBoard))
+	s.mux.HandleFunc("GET /api/system", s.requireAuth(s.handleSystem))
+	s.mux.HandleFunc("GET /api/wan", s.requireAuth(s.handleWan))
+	s.mux.HandleFunc("GET /api/wan/config", s.requireAuth(s.handleWanConfigGet))
+	s.mux.HandleFunc("POST /api/wan/config", s.requireAuth(s.handleWanConfigPost))
+	s.mux.HandleFunc("POST /api/wan/public-ip", s.requireAuth(s.handleWanPublicIP))
+	s.mux.HandleFunc("GET /api/multiwan", s.requireAuth(s.handleMultiWanGet))
+	s.mux.HandleFunc("POST /api/multiwan", s.requireAuth(s.handleMultiWanSet))
+	s.mux.HandleFunc("POST /api/multiwan/primary", s.requireAuth(s.handleMultiWanPrimary))
+	s.mux.HandleFunc("GET /api/wireless", s.requireAuth(s.handleWireless))
+	s.mux.HandleFunc("GET /api/leases", s.requireAuth(s.handleLeases))
+	s.mux.HandleFunc("GET /api/ipv6", s.requireAuth(s.handleIPv6Get))
+	s.mux.HandleFunc("POST /api/ipv6", s.requireAuth(s.handleIPv6Set))
+	s.mux.HandleFunc("POST /api/password", s.requireAuth(s.handlePasswordSet))
+	s.mux.HandleFunc("GET /api/update", s.requireAuth(s.handleUpdateCheck))
+	s.mux.HandleFunc("POST /api/update", s.requireAuth(s.handleUpdateStart))
+	s.mux.HandleFunc("GET /api/wireguard", s.requireAuth(s.handleWGGet))
+	s.mux.HandleFunc("POST /api/wireguard", s.requireAuth(s.handleWGSet))
+	s.mux.HandleFunc("POST /api/wireguard/peers", s.requireAuth(s.handleWGPeerAdd))
+	s.mux.HandleFunc("POST /api/wireguard/peers/qr", s.requireAuth(s.handleWGPeerQR))
+	s.mux.HandleFunc("POST /api/wireguard/peers/delete", s.requireAuth(s.handleWGPeerDelete))
+	s.mux.HandleFunc("GET /api/ddns", s.requireAuth(s.handleDDNSGet))
+	s.mux.HandleFunc("POST /api/ddns", s.requireAuth(s.handleDDNSSet))
+	s.mux.HandleFunc("DELETE /api/ddns", s.requireAuth(s.handleDDNSDelete))
+	s.mux.HandleFunc("POST /api/ddns/force", s.requireAuth(s.handleDDNSForce))
+	s.mux.HandleFunc("GET /api/banip", s.requireAuth(s.handleBanipGet))
+	s.mux.HandleFunc("POST /api/banip/action", s.requireAuth(s.handleBanipAction))
+	s.mux.HandleFunc("POST /api/banip/feeds", s.requireAuth(s.handleBanipFeeds))
+	s.mux.HandleFunc("POST /api/banip/install", s.requireAuth(s.handleBanipInstall))
+	s.mux.HandleFunc("POST /api/banip/uninstall", s.requireAuth(s.handleBanipUninstall))
+	s.mux.HandleFunc("GET /api/banip/status", s.requireAuth(s.handleBanipStatus))
+	s.mux.HandleFunc("POST /api/banip/dismiss-ram-warning", s.requireAuth(s.handleBanipDismissRamWarning))
+	s.mux.HandleFunc("GET /api/banip/search", s.requireAuth(s.handleBanipSearch))
+	s.mux.HandleFunc("GET /api/banip/allowlist", s.requireAuth(s.handleBanipListGet))
+	s.mux.HandleFunc("POST /api/banip/allowlist", s.requireAuth(s.handleBanipListAdd))
+	s.mux.HandleFunc("DELETE /api/banip/allowlist", s.requireAuth(s.handleBanipListDelete))
+	s.mux.HandleFunc("GET /api/banip/blocklist", s.requireAuth(s.handleBanipListGet))
+	s.mux.HandleFunc("POST /api/banip/blocklist", s.requireAuth(s.handleBanipListAdd))
+	s.mux.HandleFunc("DELETE /api/banip/blocklist", s.requireAuth(s.handleBanipListDelete))
+	s.mux.HandleFunc("GET /api/upnp", s.requireAuth(s.handleUpnpGet))
+	s.mux.HandleFunc("GET /api/upnp/status", s.requireAuth(s.handleUpnpStatus))
+	s.mux.HandleFunc("POST /api/upnp/action", s.requireAuth(s.handleUpnpAction))
+	s.mux.HandleFunc("POST /api/upnp/install", s.requireAuth(s.handleUpnpInstall))
+	s.mux.HandleFunc("POST /api/upnp/uninstall", s.requireAuth(s.handleUpnpUninstall))
+	s.mux.HandleFunc("POST /api/upnp/rule", s.requireAuth(s.handleUpnpRuleAdd))
+	s.mux.HandleFunc("DELETE /api/upnp/rule", s.requireAuth(s.handleUpnpRuleDelete))
+	s.mux.HandleFunc("GET /api/sqm", s.requireAuth(s.handleSQMGet))
+	s.mux.HandleFunc("POST /api/sqm", s.requireAuth(s.handleSQMSet))
+	s.mux.HandleFunc("POST /api/sqm/test", s.requireAuth(s.handleBufferbloatTest))
+	s.mux.HandleFunc("GET /api/sqm/history", s.requireAuth(s.handleBufferbloatHistory))
+	s.mux.HandleFunc("GET /api/openvpn", s.requireAuth(s.handleOVPNGet))
+	s.mux.HandleFunc("POST /api/openvpn", s.requireAuth(s.handleOVPNSet))
+	s.mux.HandleFunc("POST /api/openvpn/clients", s.requireAuth(s.handleOVPNClientAdd))
+	s.mux.HandleFunc("POST /api/openvpn/clients/delete", s.requireAuth(s.handleOVPNClientDelete))
+	s.mux.HandleFunc("POST /api/openvpn/host", s.requireAuth(s.handleOVPNHostSet))
+	s.mux.HandleFunc("GET /api/packages", s.requireAuth(s.handlePackagesGet))
+	s.mux.HandleFunc("GET /api/packages/optional", s.requireAuth(s.handleOptionalPackagesGet))
+	s.mux.HandleFunc("POST /api/packages/upgrade", s.requireAuth(s.handlePackageUpgrade))
+	s.mux.HandleFunc("POST /api/packages/remove", s.requireAuth(s.handlePackagesRemove))
+	s.mux.HandleFunc("GET /api/iotwifi", s.requireAuth(s.handleIoTGet))
+	s.mux.HandleFunc("POST /api/iotwifi", s.requireAuth(s.handleIoTSet))
+	s.mux.HandleFunc("GET /api/portforward", s.requireAuth(s.handleFwdGet))
+	s.mux.HandleFunc("POST /api/portforward", s.requireAuth(s.handleFwdAdd))
+	s.mux.HandleFunc("POST /api/portforward/delete", s.requireAuth(s.handleFwdDelete))
+	s.mux.HandleFunc("GET /api/tailscale", s.requireAuth(s.handleTSGet))
+	s.mux.HandleFunc("POST /api/tailscale", s.requireAuth(s.handleTSSet))
+	s.mux.HandleFunc("GET /api/guestwifi", s.requireAuth(s.handleGuestGet))
+	s.mux.HandleFunc("POST /api/guestwifi", s.requireAuth(s.handleGuestSet))
+	s.mux.HandleFunc("GET /api/captiveportal", s.requireAuth(s.handleCaptivePortalGet))
+	s.mux.HandleFunc("POST /api/captiveportal", s.requireAuth(s.handleCaptivePortalSet))
+	s.mux.HandleFunc("POST /api/captiveportal/image", s.requireAuth(s.handleCaptivePortalImage))
+	s.mux.HandleFunc("GET /api/snmp", s.requireAuth(s.handleSNMPGet))
+	s.mux.HandleFunc("POST /api/snmp", s.requireAuth(s.handleSNMPSet))
+	s.mux.HandleFunc("GET /api/mode", s.requireAuth(s.handleMode))
+	s.mux.HandleFunc("POST /api/mode", s.requireAuth(s.handleModeSet))
+	s.mux.HandleFunc("GET /api/access", s.requireAuth(s.handleAccessGet))
+	s.mux.HandleFunc("POST /api/access", s.requireAuth(s.handleAccessSet))
+	s.mux.HandleFunc("GET /api/remoteaccess", s.requireAuth(s.handleRemoteGet))
+	s.mux.HandleFunc("POST /api/remoteaccess", s.requireAuth(s.handleRemoteSet))
+	s.mux.HandleFunc("GET /api/offload", s.requireAuth(s.handleOffloadGet))
+	s.mux.HandleFunc("POST /api/offload", s.requireAuth(s.handleOffloadSet))
+	s.mux.HandleFunc("GET /api/mdns", s.requireAuth(s.handleMDNSGet))
+	s.mux.HandleFunc("POST /api/mdns", s.requireAuth(s.handleMDNSSet))
+	s.mux.HandleFunc("GET /api/wifi", s.requireAuth(s.handleWifiGet))
+	s.mux.HandleFunc("GET /api/wifi/key", s.requireAuth(s.handleWifiKey))
+	s.mux.HandleFunc("POST /api/wifi", s.requireAuth(s.handleWifiSet))
+	s.mux.HandleFunc("POST /api/wifi/radio", s.requireAuth(s.handleWifiRadioSet))
+	s.mux.HandleFunc("GET /api/wifischedule", s.requireAuth(s.handleWifiScheduleGet))
+	s.mux.HandleFunc("POST /api/wifischedule", s.requireAuth(s.handleWifiScheduleSet))
+	s.mux.HandleFunc("GET /api/wifichan", s.requireAuth(s.handleWifiChanGet))
+	s.mux.HandleFunc("POST /api/wifichan", s.requireAuth(s.handleWifiChanSet))
+	s.mux.HandleFunc("GET /api/lan", s.requireAuth(s.handleLANGet))
+	s.mux.HandleFunc("POST /api/lan", s.requireAuth(s.handleLANSet))
+	s.mux.HandleFunc("POST /api/lan/dhcp", s.requireAuth(s.handleDHCPSet))
+	s.mux.HandleFunc("POST /api/lan/reservation", s.requireAuth(s.handleReservationSet))
+	s.mux.HandleFunc("POST /api/lan/reservations/clear", s.requireAuth(s.handleReservationsClear))
+	s.mux.HandleFunc("GET /api/dns", s.requireAuth(s.handleDNSGet))
+	s.mux.HandleFunc("POST /api/dns", s.requireAuth(s.handleDNSSet))
+	s.mux.HandleFunc("POST /api/dns/adguard/action", s.requireAuth(s.handleAdGuardAction))
+	s.mux.HandleFunc("GET /api/dns/adguard/credentials", s.requireAuth(s.handleAdGuardCredentials))
+	s.mux.HandleFunc("POST /api/dns/adguard/protection", s.requireAuth(s.handleAdGuardProtection))
+	s.mux.HandleFunc("POST /api/dns/doh/action", s.requireAuth(s.handleAdGuardDoH))
+	s.mux.HandleFunc("POST /api/dns/hosts", s.requireAuth(s.handleDNSHostsSet))
+	s.mux.HandleFunc("GET /api/netdev", s.requireAuth(s.handleNetDev))
+	s.mux.HandleFunc("GET /api/ethports", s.requireAuth(s.handleEthPorts))
+	s.mux.HandleFunc("GET /api/usteer", s.requireAuth(s.handleUsteer))
+	s.mux.HandleFunc("GET /api/clients", s.requireAuth(s.handleClients))
+	s.mux.HandleFunc("GET /api/l2clients", s.requireAuth(s.handleL2Clients))
+	s.mux.HandleFunc("GET /api/clients/blocked", s.requireAuth(s.handleClientsBlocked))
+	s.mux.HandleFunc("GET /api/clients/meta", s.requireAuth(s.handleClientMeta))
+	s.mux.HandleFunc("POST /api/clients/meta", s.requireAuth(s.handleSetClientMeta))
+	s.mux.HandleFunc("POST /api/clients/reserve", s.requireAuth(s.handleClientReserve))
+	s.mux.HandleFunc("POST /api/clients/block", s.requireAuth(s.handleClientBlock))
+	s.mux.HandleFunc("GET /api/parental", s.requireAuth(s.handleParentalGet))
+	s.mux.HandleFunc("POST /api/parental", s.requireAuth(s.handleParentalSet))
+	s.mux.HandleFunc("DELETE /api/parental", s.requireAuth(s.handleParentalDelete))
+	s.mux.HandleFunc("GET /api/config/snapshots", s.requireAuth(s.handleSnapshotsList))
+	s.mux.HandleFunc("POST /api/config/snapshot", s.requireAuth(s.handleSnapshotCreate))
+	s.mux.HandleFunc("DELETE /api/config/snapshot", s.requireAuth(s.handleSnapshotDelete))
+	s.mux.HandleFunc("GET /api/config/diff", s.requireAuth(s.handleSnapshotDiff))
+	s.mux.HandleFunc("POST /api/config/rollback", s.requireAuth(s.handleSnapshotRollback))
+	s.mux.HandleFunc("GET /api/config/snapshot/export", s.requireAuth(s.handleSnapshotExport))
+	s.mux.HandleFunc("GET /api/config/confirm", s.requireAuth(s.handleConfirmStatus))
+	s.mux.HandleFunc("POST /api/config/confirm", s.requireAuth(s.handleConfirmKeep))
+	s.mux.HandleFunc("POST /api/config/confirm/rollback", s.requireAuth(s.handleConfirmRevert))
+	s.mux.HandleFunc("POST /api/ports/bounce", s.requireAuth(s.handlePortBounce))
+	s.mux.HandleFunc("POST /api/ports/block", s.requireAuth(s.handlePortBlock))
+	s.mux.HandleFunc("GET /api/vlans", s.requireAuth(s.handleVLANsGet))
+	s.mux.HandleFunc("POST /api/vlans", s.requireAuth(s.handleVLANsSet))
+	s.mux.HandleFunc("DELETE /api/vlans", s.requireAuth(s.handleVLANsDelete))
+	s.mux.HandleFunc("GET /api/stp", s.requireAuth(s.handleSTPGet))
+	s.mux.HandleFunc("POST /api/stp/bridge", s.requireAuth(s.handleSTPBridgeSet))
+	s.mux.HandleFunc("POST /api/stp/port", s.requireAuth(s.handleSTPPortSet))
+	s.mux.HandleFunc("GET /api/physports", s.requireAuth(s.handlePhysPortsGet))
+	s.mux.HandleFunc("POST /api/physports/port", s.requireAuth(s.handlePhysPortSet))
+	s.mux.HandleFunc("GET /api/lag", s.requireAuth(s.handleLAGGet))
+	s.mux.HandleFunc("POST /api/lag", s.requireAuth(s.handleLAGSet))
+	s.mux.HandleFunc("DELETE /api/lag", s.requireAuth(s.handleLAGDelete))
+	s.mux.HandleFunc("GET /api/https", s.requireAuth(s.handleHTTPSGet))
+	s.mux.HandleFunc("POST /api/https", s.requireAuth(s.handleHTTPSSet))
+	s.mux.HandleFunc("POST /api/wol", s.requireAuth(s.handleWoL))
+	s.mux.HandleFunc("GET /api/cpu", s.requireAuth(s.handleCPUGet))
+	s.mux.HandleFunc("GET /api/nlbwmon", s.requireAuth(s.handleNlbwmonGet))
+	s.mux.HandleFunc("GET /api/nlbwmon/top", s.requireAuth(s.handleNlbwmonTopGet))
+	s.mux.HandleFunc("POST /api/nlbwmon", s.requireAuth(s.handleNlbwmonSet))
+	s.mux.HandleFunc("GET /api/firewall", s.requireAuth(s.handleFirewallGet))
+	s.mux.HandleFunc("POST /api/firewall", s.requireAuth(s.handleFirewallAddRule))
+	s.mux.HandleFunc("DELETE /api/firewall", s.requireAuth(s.handleFirewallDelRule))
+	s.mux.HandleFunc("GET /api/templates", s.requireAuth(s.handleTemplatesGet))
+	s.mux.HandleFunc("POST /api/templates", s.requireAuth(s.handleTemplatesApply))
+	s.mux.HandleFunc("GET /api/switch", s.requireAuth(s.handleSwitchGet))
+	s.mux.HandleFunc("POST /api/switch", s.requireAuth(s.handleSwitchSet))
+	s.mux.HandleFunc("GET /api/port-stats", s.requireAuth(s.handlePortStatsGet))
+	s.mux.HandleFunc("GET /api/switch/modes", s.requireAuth(s.handleSwitchModesGet))
+	s.mux.HandleFunc("POST /api/switch/modes", s.requireAuth(s.handleSwitchModesApply))
+	s.mux.HandleFunc("GET /api/poe", s.requireAuth(s.handlePoEGet))
+	s.mux.HandleFunc("POST /api/poe/schedule", s.requireAuth(s.handlePoESchedule))
+	s.mux.HandleFunc("GET /api/poe/watchdog", s.requireAuth(s.handlePoEWatchdogGet))
+	s.mux.HandleFunc("POST /api/poe/watchdog", s.requireAuth(s.handlePoEWatchdogSet))
+	s.mux.HandleFunc("GET /api/port-templates", s.requireAuth(s.handlePortTemplatesGet))
+	s.mux.HandleFunc("POST /api/port-templates", s.requireAuth(s.handlePortTemplatesSave))
+	s.mux.HandleFunc("DELETE /api/port-templates", s.requireAuth(s.handlePortTemplatesDelete))
+	s.mux.HandleFunc("POST /api/port-templates/apply", s.requireAuth(s.handlePortTemplatesApply))
+	s.mux.HandleFunc("GET /api/roles", s.requireAuth(s.handleRolesGet))
+	s.mux.HandleFunc("POST /api/roles", s.requireAuth(s.handleRolesApply))
+	s.mux.HandleFunc("GET /api/dpi", s.requireAuth(s.handleDPIGet))
+	s.mux.HandleFunc("GET /api/dpi/apps", s.requireAuth(s.handleDPIAppsGet))
+	s.mux.HandleFunc("GET /api/dpi/timeline", s.requireAuth(s.handleDPITimelineGet))
+	s.mux.HandleFunc("GET /api/netifyd", s.requireAuth(s.handleNetifydGet))
+	s.mux.HandleFunc("POST /api/netifyd", s.requireAuth(s.handleNetifydSet))
+	s.mux.HandleFunc("GET /api/history", s.requireAuth(s.handleHistoryGet))
+	s.mux.HandleFunc("GET /api/igmp", s.requireAuth(s.handleIGMPGet))
+	s.mux.HandleFunc("POST /api/igmp", s.requireAuth(s.handleIGMPSet))
+	s.mux.HandleFunc("GET /api/loops", s.requireAuth(s.handleLoops))
+	s.mux.HandleFunc("GET /api/selfupdate", s.requireAuth(s.handleSelfUpdateCheck))
+	s.mux.HandleFunc("GET /api/announcement", s.requireAuth(s.handleAnnouncement))
+	s.mux.HandleFunc("GET /api/selfupdate/status", s.requireAuth(s.handleSelfUpdateStatus))
+	s.mux.HandleFunc("POST /api/selfupdate", s.requireAuth(s.handleSelfUpdateApply))
+	s.mux.HandleFunc("GET /api/selfupdate/schedule", s.requireAuth(s.handleSelfUpdateSchedule))
+	s.mux.HandleFunc("PUT /api/selfupdate/schedule", s.requireAuth(s.handleSelfUpdateSchedulePut))
+	s.mux.HandleFunc("GET /api/wizard", s.requireAuth(s.handleWizardGet))
+	s.mux.HandleFunc("GET /api/wizard/setup", s.requireAuth(s.handleWizardSetupGet))
+	s.mux.HandleFunc("POST /api/wizard/setup", s.requireAuth(s.handleWizardSetupPost))
+	s.mux.HandleFunc("POST /api/wizard/packages", s.requireAuth(s.handleWizardPackages))
+	s.mux.HandleFunc("GET /api/wizard/job", s.requireAuth(s.handleInstallJobGet))
+	s.mux.HandleFunc("POST /api/wizard/complete", s.requireAuth(s.handleWizardComplete))
+	s.mux.HandleFunc("POST /api/wizard/reset", s.requireAuth(s.handleWizardReset))
+	s.mux.HandleFunc("GET /api/drift", s.requireAuth(s.handleDriftGet))
+	s.mux.HandleFunc("GET /api/telegram", s.requireAuth(s.handleTelegramGet))
+	s.mux.HandleFunc("POST /api/telegram", s.requireAuth(s.handleTelegramSet))
+	s.mux.HandleFunc("POST /api/telegram/test", s.requireAuth(s.handleTelegramTest))
+	s.mux.HandleFunc("GET /api/ntfy", s.requireAuth(s.handleNtfyGet))
+	s.mux.HandleFunc("POST /api/ntfy", s.requireAuth(s.handleNtfySet))
+	s.mux.HandleFunc("POST /api/ntfy/test", s.requireAuth(s.handleNtfyTest))
+	s.mux.HandleFunc("GET /api/fleet", s.requireAuth(s.handleFleetGet))
+	s.mux.HandleFunc("POST /api/fleet", s.requireAuth(s.handleFleetAdd))
+	s.mux.HandleFunc("DELETE /api/fleet", s.requireAuth(s.handleFleetDelete))
+	s.mux.HandleFunc("POST /api/fleet/check", s.requireAuth(s.handleFleetCheck))
+	s.mux.HandleFunc("POST /api/fleet/check-all", s.requireAuth(s.handleFleetCheckAll))
+	s.mux.HandleFunc("POST /api/fleet/update", s.requireAuth(s.handleFleetUpdate))
+	s.mux.HandleFunc("GET /api/fleet/discovery-config", s.requireAuth(s.handleFleetDiscoveryConfigGet))
+	s.mux.HandleFunc("POST /api/fleet/discovery-config", s.requireAuth(s.handleFleetDiscoveryConfigSet))
+	s.mux.HandleFunc("GET /api/fleet/discovered", s.requireAuth(s.handleFleetDiscovered))
+	s.mux.HandleFunc("POST /api/fleet/adopt", s.requireAuth(s.handleFleetAdopt))
+	s.mux.HandleFunc("GET /api/cable-test", s.requireAuth(s.handleCableTestGet))
+	s.mux.HandleFunc("GET /api/diagnostics/selftest", s.requireAuth(s.handleDiagnosticsSelfTest))
+	s.mux.HandleFunc("POST /api/diagnostics", s.requireAuth(s.handleDiagnosticsRun))
+	s.mux.HandleFunc("GET /api/storm", s.requireAuth(s.handleStormGet))
+	s.mux.HandleFunc("POST /api/storm", s.requireAuth(s.handleStormSet))
+	s.mux.HandleFunc("GET /api/mirror", s.requireAuth(s.handleMirrorGet))
+	s.mux.HandleFunc("GET /api/management-port", s.requireAuth(s.handleManagementPortGet))
+	s.mux.HandleFunc("POST /api/mirror", s.requireAuth(s.handleMirrorSet))
+	s.mux.HandleFunc("GET /api/ratelimit", s.requireAuth(s.handleRateGet))
+	s.mux.HandleFunc("POST /api/ratelimit", s.requireAuth(s.handleRateSet))
+	s.mux.HandleFunc("GET /api/port-isolation", s.requireAuth(s.handlePortIsolationGet))
+	s.mux.HandleFunc("POST /api/port-isolation", s.requireAuth(s.handlePortIsolationSet))
+	s.mux.HandleFunc("GET /api/port-security", s.requireAuth(s.handlePortSecurityGet))
+	s.mux.HandleFunc("POST /api/port-security/learning", s.requireAuth(s.handlePortSecurityLearningSet))
+	s.mux.HandleFunc("POST /api/port-security/fdb", s.requireAuth(s.handlePortSecurityFdbSet))
+	s.mux.HandleFunc("GET /api/storage", s.requireAuth(s.handleStorageGet))
+	s.mux.HandleFunc("POST /api/storage", s.requireAuth(s.handleStorageSet))
+	s.mux.HandleFunc("GET /api/mac-acl", s.requireAuth(s.handleMACACLGet))
+	s.mux.HandleFunc("POST /api/mac-acl", s.requireAuth(s.handleMACACLSet))
+	s.mux.HandleFunc("GET /api/netpulse", s.requireAuth(s.handleNetPulseGet))
+	s.mux.HandleFunc("POST /api/netpulse", s.requireAuth(s.handleNetPulseSet))
+	s.mux.HandleFunc("GET /api/mqtt", s.requireAuth(s.handleMQTTGet))
+	s.mux.HandleFunc("PUT /api/mqtt", s.requireAuth(s.handleMQTTSet))
+	s.mux.HandleFunc("POST /api/mqtt/test", s.requireAuth(s.handleMQTTTest))
+	s.mux.HandleFunc("POST /api/reboot", s.requireAuth(s.handleReboot))
+	s.mux.HandleFunc("GET /api/nftqos", s.requireAuth(s.handleNftQoSGet))
+	s.mux.HandleFunc("POST /api/nftqos", s.requireAuth(s.handleNftQoSSet))
+	s.mux.HandleFunc("DELETE /api/nftqos", s.requireAuth(s.handleNftQoSDelete))
+	s.mux.HandleFunc("GET /api/quotas", s.requireAuth(s.handleQuotaGet))
+	s.mux.HandleFunc("POST /api/quotas", s.requireAuth(s.handleQuotaSet))
+	s.mux.HandleFunc("DELETE /api/quotas", s.requireAuth(s.handleQuotaDelete))
+	s.mux.HandleFunc("GET /api/push-config", s.requireAuth(s.handlePushConfigGet))
+	s.mux.HandleFunc("POST /api/push-config", s.requireAuth(s.handlePushConfigSet))
+	s.mux.HandleFunc("POST /api/push-config/push", s.requireAuth(s.handlePushSnapshot))
+	s.mux.HandleFunc("GET /api/lanservices", s.requireAuth(s.handleLanServicesGet))
+	s.mux.HandleFunc("POST /api/lanservices", s.requireAuth(s.handleLanServicesPost))
+	s.mux.HandleFunc("POST /api/lanservices/discover", s.requireAuth(s.handleLanServicesDiscover))
+	s.mux.HandleFunc("DELETE /api/lanservices", s.requireAuth(s.handleLanServicesDelete))
+	s.mux.HandleFunc("POST /api/executor/apply", s.handleExecutorApply)
+	s.mux.HandleFunc("GET /api/executor/token", s.requireAuth(s.handleExecutorToken))
+	s.mux.HandleFunc("POST /api/netpulse/agent/restart", s.handleAgentRestart)
+	return s
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mux.ServeHTTP(w, r)
+}
+
+// handleSPA serves the embedded frontend with SPA fallback to index.html.
+func (s *Server) handleSPA(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		http.NotFound(w, r)
+		return
+	}
+	dist, err := fs.Sub(distFS, "dist")
+	if err != nil {
+		http.Error(w, "frontend not embedded", http.StatusInternalServerError)
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/")
+	if path != "" {
+		if f, err := dist.Open(path); err == nil {
+			f.Close()
+			// Built assets carry a content hash in their name, so a change
+			// produces a different URL: they can be cached forever.
+			if strings.HasPrefix(path, "assets/") {
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			}
+			http.FileServer(http.FS(dist)).ServeHTTP(w, r)
+			return
+		}
+		if serveCompressedAsset(w, r, dist, path) {
+			return
+		}
+	}
+	data, err := fs.ReadFile(dist, "index.html")
+	if err != nil {
+		http.Error(w, "frontend not embedded", http.StatusInternalServerError)
+		return
+	}
+	// index.html must never be cached: it is what names the hashed bundle.
+	// Served without this, a browser reuses the old copy after an upgrade
+	// and keeps loading the previous frontend against the new backend —
+	// which looks like a bug in whatever changed, not like a stale page.
+	w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(data)
+}
+
+func serveCompressedAsset(w http.ResponseWriter, r *http.Request, files fs.FS, name string) bool {
+	compressed, err := fs.ReadFile(files, name+".gz")
+	if err != nil {
+		return false
+	}
+	if contentType := mime.TypeByExtension(path.Ext(name)); contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+	w.Header().Set("Vary", "Accept-Encoding")
+	if strings.HasPrefix(name, "assets/") {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	}
+	if acceptsGzip(r.Header.Get("Accept-Encoding")) {
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write(compressed)
+		return true
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		http.Error(w, "invalid embedded asset", http.StatusInternalServerError)
+		return true
+	}
+	defer reader.Close()
+	_, _ = io.Copy(w, reader)
+	return true
+}
+
+func acceptsGzip(header string) bool {
+	for _, value := range strings.Split(header, ",") {
+		parts := strings.Split(strings.TrimSpace(value), ";")
+		if strings.EqualFold(strings.TrimSpace(parts[0]), "gzip") {
+			for _, parameter := range parts[1:] {
+				if strings.TrimSpace(parameter) == "q=0" {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	return false
+}
+
+type loginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	addr := clientAddr(r)
+	if wait := s.logins.retryAfter(addr); wait > 0 {
+		seconds := int(wait.Seconds()) + 1
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		writeError(w, http.StatusTooManyRequests,
+			fmt.Sprintf("too many attempts, try again in %d seconds", seconds))
+		return
+	}
+	var req loginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if req.Username == "" {
+		req.Username = "root"
+	}
+	ok, err := auth.ValidatePassword(s.rpcdURL, req.Username, req.Password)
+	if err != nil {
+		log.Printf("login: rpcd validation error: %v", err)
+		writeError(w, http.StatusBadGateway, "rpcd unreachable")
+		return
+	}
+	if !ok {
+		// Logged because this is the router's root password: a panel that
+		// accepts it should say when it was offered and refused. It is
+		// also the only way to tell a rejected attempt from one that never
+		// arrived, which is a real question when a browser is holding a
+		// cookie it will not replace.
+		if wait := s.logins.failed(addr); wait > 0 {
+			log.Printf("login: refused for %q from %s, throttled for %s", req.Username, addr, wait)
+		} else {
+			log.Printf("login: refused for %q from %s", req.Username, addr)
+		}
+		writeError(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+	ttl := time.Duration(modules.PanelSessionTTLMinutes()) * time.Minute
+	token, err := auth.NewSessionToken(ttl)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "session token")
+		return
+	}
+	s.logins.succeeded(addr)
+	cookie := s.sessionCookieFor(token, int(ttl.Seconds()))
+	http.SetCookie(w, cookie)
+	log.Printf("login: accepted for %q from %s, session cookie %q (secure=%v)",
+		req.Username, addr, cookie.Name, cookie.Secure)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// clientAddr is the peer address without the port, for the log.
+func clientAddr(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// sessionCookie reads the session cookie under the name that belongs to the
+// current transport, and accepts the other as a fallback: between a change of
+// scheme and the next login, either may arrive.
+//
+// The second return value says the fallback name was the one that matched,
+// which is what lets a session carry across the switch without also letting a
+// token issued in clear keep its old, weaker cookie forever.
+func (s *Server) sessionCookie(r *http.Request) (*http.Cookie, bool, error) {
+	if c, err := r.Cookie(s.sessionCookieName()); err == nil {
+		return c, false, nil
+	}
+	// Any other name we have ever issued. Whichever answers, the session is
+	// real and is moved onto the current name by the caller.
+	for _, name := range s.otherSessionCookieNames() {
+		if c, err := r.Cookie(name); err == nil {
+			return c, true, nil
+		}
+	}
+	// Never (nil, nil): the caller reads c.Value straight after checking
+	// the error, so a nil error with no cookie would panic the handler.
+	return nil, false, http.ErrNoCookie
+}
+
+// sessionCookieName is the name that belongs to the current transport.
+func (s *Server) sessionCookieName() string {
+	if s.secure {
+		return secureSessionCookie
+	}
+	return httpSessionCookie
+}
+
+// otherSessionCookieNames are the names a session may still arrive under.
+func (s *Server) otherSessionCookieNames() []string {
+	if s.secure {
+		return []string{httpSessionCookie, legacySessionCookie}
+	}
+	// Not secureSessionCookie: a browser never sends a __Secure- cookie
+	// over plain HTTP, so asking for it would only ever find nothing.
+	return []string{legacySessionCookie}
+}
+
+// reissueUnderCurrentName moves a session to the cookie name this transport
+// should be using, and expires the one it arrived under.
+//
+// Over TLS that matters: the __Secure- prefix buys nothing while the plain
+// name stays an accepted alias, so a token issued over plain HTTP - one that
+// may have been read off the LAN - would otherwise keep working, unprotected,
+// for the rest of its life.
+func (s *Server) reissueUnderCurrentName(w http.ResponseWriter, token string) {
+	ttl := time.Duration(modules.PanelSessionTTLMinutes()) * time.Minute
+	http.SetCookie(w, s.sessionCookieFor(token, int(ttl.Seconds())))
+	for _, name := range s.otherSessionCookieNames() {
+		// Best effort: a Secure cookie cannot be expired from a plaintext
+		// origin, which is the whole reason the names changed. The one
+		// that can be cleared is, and the session is on the right name
+		// either way.
+		http.SetCookie(w, &http.Cookie{
+			Name:     name,
+			Value:    "",
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   -1,
+		})
+	}
+}
+
+// sessionCookieFor builds the session cookie. Secure follows the transport
+// the panel was started with: behind a proxy r.TLS is nil, and deducing it
+// from the request would drop the flag exactly where it is needed most.
+
+func (s *Server) sessionCookieFor(token string, maxAge int) *http.Cookie {
+	return &http.Cookie{
+		Name:     s.sessionCookieName(),
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   s.secure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   maxAge,
+	}
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if c, _, err := s.sessionCookie(r); err == nil {
+		s.mu.Lock()
+		s.revoked[c.Value] = true
+		s.mu.Unlock()
+	}
+	// The same attributes it was issued with: a browser replaces a cookie
+	// only when the name, path and flags match, so clearing it with any
+	// others would leave the session alive in the browser.
+	http.SetCookie(w, s.sessionCookieFor("", -1))
+	// And every other name it might have arrived under. Revocation alone
+	// is not enough: s.revoked lives in memory and does not survive the
+	// restart this feature causes, so a cookie left behind would
+	// authenticate again afterwards.
+	for _, name := range s.otherSessionCookieNames() {
+		http.SetCookie(w, &http.Cookie{
+			Name: name, Value: "", Path: "/", HttpOnly: true,
+			SameSite: http.SameSiteLaxMode, MaxAge: -1,
+		})
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleMe(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		c, legacyName, err := s.sessionCookie(r)
+		if err != nil || !auth.ValidSessionToken(c.Value) || s.isRevoked(c.Value) {
+			writeError(w, http.StatusUnauthorized, "login required")
+			return
+		}
+		if legacyName {
+			s.reissueUnderCurrentName(w, c.Value)
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) isRevoked(token string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revoked[token]
+}
+
+func (s *Server) handleBoard(w http.ResponseWriter, _ *http.Request) {
+	raw, err := ubus.DefaultBackend.SystemBoard()
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(raw)
+}
+
+func (s *Server) handleSystem(w http.ResponseWriter, _ *http.Request) {
+	info, err := ubus.DefaultBackend.SystemInfo()
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, info)
+}
+
+func (s *Server) handleWan(w http.ResponseWriter, _ *http.Request) {
+	status, err := ubus.DefaultBackend.WanStatus()
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, status)
+}
+
+func (s *Server) handleWanConfigGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ReadWANConfig())
+}
+
+// handleWanPublicIP asks an outside service what address this router comes
+// from. A POST, not a GET: it leaves the network, and that should not
+// happen on a refresh.
+func (s *Server) handleWanPublicIP(w http.ResponseWriter, _ *http.Request) {
+	res, err := modules.CheckPublicIP()
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, res)
+}
+
+type multiWanPrimaryRequest struct {
+	Iface string `json:"iface"`
+}
+
+// handleMultiWanSet applies a mode. The module answers with the new state
+// and whether it had to roll back, like every other write.
+func (s *Server) handleMultiWanSet(w http.ResponseWriter, r *http.Request) {
+	var req modules.MultiWanRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.ApplyMultiWAN(req)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleMultiWanPrimary(w http.ResponseWriter, r *http.Request) {
+	var req multiWanPrimaryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetMultiWANPrimary(req.Iface)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+// handleMultiWanGet lists the internet uplinks and, when mwan3 is
+// installed, what it is doing with them. Read-only.
+func (s *Server) handleMultiWanGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeMultiWAN())
+}
+
+func (s *Server) handleWanConfigPost(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		modules.WANConfig
+		Confirm bool `json:"confirm,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	var snapshots map[string]string
+	if req.Confirm {
+		snapshots = snapshotConfigs("network")
+	}
+	applied, err := modules.ApplyWANConfig(req.WANConfig)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if req.Confirm {
+		id, expires := s.armConfirm(func() error {
+			return revertSnapshots(snapshots, []string{"network"})
+		}, confirmTimeout)
+		// Keep the WANConfig shape and attach the confirm on top, so a
+		// non-confirming client sees exactly what it saw before.
+		b, _ := json.Marshal(applied)
+		out := map[string]any{}
+		_ = json.Unmarshal(b, &out)
+		out["confirm"] = map[string]any{"id": id, "expires": expires.Unix()}
+		writeJSON(w, out)
+		return
+	}
+	writeJSON(w, applied)
+}
+
+func (s *Server) handleWireless(w http.ResponseWriter, _ *http.Request) {
+	radios, err := modules.CachedRead("wireless", probeCacheTTL, func() ([]ubus.WirelessRadio, error) {
+		return ubus.DefaultBackend.WirelessStatus()
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, radios)
+}
+
+func (s *Server) handleLeases(w http.ResponseWriter, _ *http.Request) {
+	leases, err := ubus.ReadLeases(leasesPath)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, leases)
+}
+
+func (s *Server) handleIPv6Get(w http.ResponseWriter, _ *http.Request) {
+	probe, _ := modules.CachedRead("ipv6", probeCacheTTL, func() (*modules.IPv6Probe, error) {
+		return modules.ProbeIPv6(), nil
+	})
+	writeJSON(w, probe)
+}
+
+type ipv6SetRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+func (s *Server) handleIPv6Set(w http.ResponseWriter, r *http.Request) {
+	var req ipv6SetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetIPv6(req.Enabled)
+	result := map[string]any{
+		"state":       probe,
+		"rolled_back": rolledBack,
+	}
+	if err != nil {
+		result["error"] = err.Error()
+		if rolledBack {
+			result["status"] = "rolled_back"
+		} else {
+			result["status"] = "failed"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(result)
+		return
+	}
+	result["status"] = "applied"
+	writeJSON(w, result)
+}
+
+type passwordSetRequest struct {
+	Current string `json:"current"`
+	Next    string `json:"next"`
+}
+
+func (s *Server) handlePasswordSet(w http.ResponseWriter, r *http.Request) {
+	var req passwordSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.ChangePassword(s.rpcdURL, req.Current, req.Next); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// The password changed: every existing panel session must die, including
+	// the caller's. The user logs in again with the new password.
+	auth.BumpEpoch()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleUpdateCheck(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.CheckUpdate())
+}
+
+type updateStartRequest struct {
+	Confirm bool `json:"confirm"`
+}
+
+func (s *Server) handleUpdateStart(w http.ResponseWriter, r *http.Request) {
+	var req updateStartRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !req.Confirm {
+		writeError(w, http.StatusBadRequest, "explicit confirmation required")
+		return
+	}
+	check := modules.CheckUpdate()
+	if !check.OwutPresent {
+		writeError(w, http.StatusBadGateway, "owut is not installed on this router")
+		return
+	}
+	if !check.SafeToProceed && !check.SafeWithReinstall {
+		writeError(w, http.StatusConflict, "owut reports it is not safe to proceed")
+		return
+	}
+	if err := modules.StartUpgrade(check.SafeWithReinstall && !check.SafeToProceed); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"started": true, "reboot_pending": true})
+}
+
+func (s *Server) handleWGGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeWG())
+}
+
+type wgSetRequest struct {
+	Action string `json:"action"` // enable | disable
+}
+
+func (s *Server) handleWGSet(w http.ResponseWriter, r *http.Request) {
+	var req wgSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	var probe *modules.WGProbe
+	var rolledBack bool
+	var err error
+	switch req.Action {
+	case "enable":
+		probe, rolledBack, err = modules.SetWG(true)
+	case "disable":
+		probe, rolledBack, err = modules.SetWG(false)
+	default:
+		writeError(w, http.StatusBadRequest, "action must be enable or disable")
+		return
+	}
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+type wgPeerAddRequest struct {
+	Name       string   `json:"name"`
+	PublicKey  string   `json:"public_key"`
+	AllowedIPs []string `json:"allowed_ips"`
+	Admin      bool     `json:"admin"`
+}
+
+func (s *Server) handleWGPeerAdd(w http.ResponseWriter, r *http.Request) {
+	var req wgPeerAddRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.AddWGPeer(req.Name, req.PublicKey, req.AllowedIPs, req.Admin)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+type wgPeerQRRequest struct {
+	Name     string `json:"name"`
+	Admin    bool   `json:"admin"`
+	Endpoint string `json:"endpoint"`
+}
+
+func (s *Server) handleWGPeerQR(w http.ResponseWriter, r *http.Request) {
+	var req wgPeerQRRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	config, probe, err := modules.AddWGPeerGenerated(req.Name, req.Admin, req.Endpoint)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"config": config, "state": probe})
+}
+
+type wgPeerDeleteRequest struct {
+	PublicKey string `json:"public_key"`
+}
+
+func (s *Server) handleWGPeerDelete(w http.ResponseWriter, r *http.Request) {
+	var req wgPeerDeleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.RemoveWGPeer(req.PublicKey)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleDDNSGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeDDNS())
+}
+
+func (s *Server) handleDDNSSet(w http.ResponseWriter, r *http.Request) {
+	var cfg modules.DDNSConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetDDNS(cfg)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+type ddnsDeleteRequest struct {
+	Section string `json:"section"`
+	Domain  string `json:"domain"`
+}
+
+func (s *Server) handleDDNSDelete(w http.ResponseWriter, r *http.Request) {
+	var req ddnsDeleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	var probe *modules.DDNSProbe
+	var rolledBack bool
+	var err error
+	if req.Section != "" {
+		probe, rolledBack, err = modules.DeleteDDNSSection(req.Section)
+	} else {
+		probe, rolledBack, err = modules.DeleteDDNS(req.Domain)
+	}
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+type ddnsForceRequest struct {
+	Section string `json:"section"`
+}
+
+func (s *Server) handleDDNSForce(w http.ResponseWriter, r *http.Request) {
+	var req ddnsForceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, err := modules.ForceDDNSUpdate(req.Section)
+	writeModuleResult(w, probe, false, err)
+}
+
+func (s *Server) handleBanipGet(w http.ResponseWriter, _ *http.Request) {
+	// Cached (TTL 3s): the probe forks several commands and the UI loads
+	// it on page open; mutations invalidate the cache.
+	writeJSON(w, modules.ProbeBanIPCached())
+}
+
+type banipActionRequest struct {
+	Action string `json:"action"`
+}
+
+func (s *Server) handleBanipAction(w http.ResponseWriter, r *http.Request) {
+	var req banipActionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.BanipAction(req.Action)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleBanipFeeds(w http.ResponseWriter, r *http.Request) {
+	var cfg modules.BanipFeedsConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetBanipFeeds(cfg)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+type banipInstallRequest struct {
+	Confirm bool `json:"confirm"`
+}
+
+func (s *Server) handleBanipInstall(w http.ResponseWriter, r *http.Request) {
+	var req banipInstallRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, err := modules.InstallBanip(req.Confirm)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, probe)
+}
+
+func (s *Server) handleBanipUninstall(w http.ResponseWriter, r *http.Request) {
+	var req banipInstallRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, err := modules.UninstallBanip(req.Confirm)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, probe)
+}
+
+func (s *Server) handleBanipStatus(w http.ResponseWriter, _ *http.Request) {
+	// Cached (TTL 2s, shared invalidation with the full probe): the status
+	// feeds the Services card and the progressive page paint.
+	writeJSON(w, modules.ProbeBanipStatusCached())
+}
+
+// handleBanipDismissRamWarning persists the dismiss of the current low-RAM
+// warning and answers with the updated probe, so the UI can drop the banner
+// without a reload.
+func (s *Server) handleBanipDismissRamWarning(w http.ResponseWriter, _ *http.Request) {
+	probe, err := modules.BanipDismissRamWarning()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, probe)
+}
+
+func (s *Server) handleBanipSearch(w http.ResponseWriter, r *http.Request) {
+	res, err := modules.SearchBanipIP(r.URL.Query().Get("ip"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, res)
+}
+
+// banipListRequest targets one local list. The list name is taken from the
+// URL path (allowlist|blocklist), never from the request body.
+type banipListRequest struct {
+	Entry string `json:"entry"`
+}
+
+func banipListName(r *http.Request) string {
+	if strings.HasSuffix(r.URL.Path, "/allowlist") {
+		return "allowlist"
+	}
+	return "blocklist"
+}
+
+func (s *Server) handleBanipListGet(w http.ResponseWriter, r *http.Request) {
+	entries, err := modules.BanipListEntries(banipListName(r))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"entries": entries})
+}
+
+func (s *Server) handleBanipListAdd(w http.ResponseWriter, r *http.Request) {
+	var req banipListRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetBanipListEntry(banipListName(r), req.Entry, false)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleBanipListDelete(w http.ResponseWriter, r *http.Request) {
+	var req banipListRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetBanipListEntry(banipListName(r), req.Entry, true)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleUpnpGet(w http.ResponseWriter, _ *http.Request) {
+	// No cache: the probe is two cheap forks (uci show + lease file read).
+	writeJSON(w, modules.ProbeUpnp())
+}
+
+func (s *Server) handleUpnpStatus(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeUpnpStatus())
+}
+
+type upnpActionRequest struct {
+	Action string `json:"action"`
+}
+
+func (s *Server) handleUpnpAction(w http.ResponseWriter, r *http.Request) {
+	var req upnpActionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.UpnpAction(req.Action)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+type upnpInstallRequest struct {
+	Confirm bool `json:"confirm"`
+}
+
+func (s *Server) handleUpnpInstall(w http.ResponseWriter, r *http.Request) {
+	var req upnpInstallRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, err := modules.InstallUpnp(req.Confirm)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, probe)
+}
+
+func (s *Server) handleUpnpUninstall(w http.ResponseWriter, r *http.Request) {
+	var req upnpInstallRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, err := modules.UninstallUpnp(req.Confirm)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, probe)
+}
+
+type upnpRuleRequest struct {
+	modules.UpnpRuleConfig
+	Section string `json:"section"`
+}
+
+func (s *Server) handleUpnpRuleAdd(w http.ResponseWriter, r *http.Request) {
+	var req upnpRuleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetUpnpRule(true, req.UpnpRuleConfig, "")
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleUpnpRuleDelete(w http.ResponseWriter, r *http.Request) {
+	var req upnpRuleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetUpnpRule(false, modules.UpnpRuleConfig{}, req.Section)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleSQMGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeSQM())
+}
+
+func (s *Server) handleSQMSet(w http.ResponseWriter, r *http.Request) {
+	var cfg modules.SQMConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetSQM(cfg)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleBufferbloatTest(w http.ResponseWriter, _ *http.Request) {
+	result, err := modules.RunBufferbloatTest()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, result)
+}
+
+func (s *Server) handleBufferbloatHistory(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{"entries": modules.GetBufferbloatHistory()})
+}
+
+func (s *Server) handleOVPNGet(w http.ResponseWriter, _ *http.Request) {
+	probe, _ := modules.CachedRead("openvpn", probeCacheTTL, func() (*modules.OVPNProbe, error) {
+		return modules.ProbeOVPN(), nil
+	})
+	writeJSON(w, probe)
+}
+
+type ovpnSetRequest struct {
+	Action string `json:"action"` // enable | disable
+}
+
+func (s *Server) handleOVPNSet(w http.ResponseWriter, r *http.Request) {
+	var req ovpnSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	var probe *modules.OVPNProbe
+	var rolledBack bool
+	var err error
+	switch req.Action {
+	case "enable":
+		probe, rolledBack, err = modules.SetOVPN(true)
+	case "disable":
+		probe, rolledBack, err = modules.SetOVPN(false)
+	default:
+		writeError(w, http.StatusBadRequest, "action must be enable or disable")
+		return
+	}
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+type ovpnClientAddRequest struct {
+	Name   string `json:"name"`
+	Remote string `json:"remote"`
+}
+
+func (s *Server) handleOVPNClientAdd(w http.ResponseWriter, r *http.Request) {
+	var req ovpnClientAddRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	config, probe, err := modules.AddOVPNClient(req.Name, req.Remote)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"config": config, "state": probe})
+}
+
+type ovpnClientDeleteRequest struct {
+	Name string `json:"name"`
+}
+
+type ovpnHostRequest struct {
+	Host string `json:"host"`
+}
+
+func (s *Server) handleOVPNClientDelete(w http.ResponseWriter, r *http.Request) {
+	var req ovpnClientDeleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, err := modules.RemoveOVPNClient(req.Name)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"state": probe})
+}
+
+func (s *Server) handleOVPNHostSet(w http.ResponseWriter, r *http.Request) {
+	var req ovpnHostRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.SetVPNPublicHost(req.Host); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, modules.ProbeOVPN())
+}
+
+func (s *Server) handlePackagesGet(w http.ResponseWriter, _ *http.Request) {
+	pkgs, err := modules.ListUpgradable()
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"upgradable": pkgs})
+}
+
+type packageUpgradeRequest struct {
+	Name string `json:"name"`
+}
+
+func (s *Server) handleOptionalPackagesGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{"packages": modules.ListOptionalPackages()})
+}
+
+type wizardPackagesRequest struct {
+	IDs []string `json:"ids"`
+}
+
+func (s *Server) handleWizardSetupGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{
+		"manager": modules.DetectPkgManager(),
+		"groups":  modules.ProbeSetupPackages(),
+	})
+}
+
+type wizardSetupRequest struct {
+	Mode   string   `json:"mode"`
+	Groups []string `json:"groups"`
+}
+
+func (s *Server) handleWizardSetupPost(w http.ResponseWriter, r *http.Request) {
+	var req wizardSetupRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	mode := modules.SetupMode(req.Mode)
+	if err := modules.WizardSetupChoice(mode); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	pkgs := modules.SetupPackagesForMode(mode, req.Groups)
+	job := modules.StartInstallPackages(pkgs)
+	writeJSON(w, map[string]any{"job": job})
+}
+
+func (s *Server) handleWizardPackages(w http.ResponseWriter, r *http.Request) {
+	var req wizardPackagesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	pkgs, err := modules.ResolveOptionalPackageIDs(req.IDs)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	job := modules.StartInstallPackages(pkgs)
+	writeJSON(w, map[string]any{"job": job})
+}
+
+func (s *Server) handleInstallJobGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{"job": modules.JobStatus()})
+}
+
+type packagesRemoveRequest struct {
+	IDs []string `json:"ids"`
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func (s *Server) handlePackagesRemove(w http.ResponseWriter, r *http.Request) {
+	var req packagesRemoveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	removed, err := modules.RemoveOptionalPackages(req.IDs)
+	writeJSON(w, map[string]any{
+		"status":   "ok",
+		"removed":  removed,
+		"packages": modules.ListOptionalPackages(),
+		"error":    errString(err),
+	})
+}
+
+func (s *Server) handlePackageUpgrade(w http.ResponseWriter, r *http.Request) {
+	var req packageUpgradeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	pkgs, err := modules.UpgradePackage(req.Name)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"upgradable": pkgs})
+}
+
+func (s *Server) handleIoTGet(w http.ResponseWriter, _ *http.Request) {
+	probe, _ := modules.CachedRead("iotwifi", probeCacheTTL, func() (*modules.IoTProbe, error) {
+		return modules.ProbeIoT(), nil
+	})
+	writeJSON(w, probe)
+}
+
+func (s *Server) handleIoTSet(w http.ResponseWriter, r *http.Request) {
+	var cfg modules.IoTConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetIoT(cfg)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleFwdGet(w http.ResponseWriter, _ *http.Request) {
+	probe, _ := modules.CachedRead("portforward", probeCacheTTL, func() (*modules.FwdProbe, error) {
+		return modules.ProbeFwd(), nil
+	})
+	writeJSON(w, probe)
+}
+
+type fwdAddRequest struct {
+	SrcDport string `json:"src_dport"`
+	DestIP   string `json:"dest_ip"`
+	DestPort string `json:"dest_port"`
+	Proto    string `json:"proto"`
+}
+
+func (s *Server) handleFwdAdd(w http.ResponseWriter, r *http.Request) {
+	var req fwdAddRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.AddFwdRule(req.SrcDport, req.DestIP, req.DestPort, req.Proto)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+type fwdDeleteRequest struct {
+	Section string `json:"section"`
+}
+
+func (s *Server) handleFwdDelete(w http.ResponseWriter, r *http.Request) {
+	var req fwdDeleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.RemoveFwdRule(req.Section)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleTSGet(w http.ResponseWriter, _ *http.Request) {
+	probe, _ := modules.CachedRead("tailscale", probeCacheTTL, func() (*modules.TSProbe, error) {
+		return modules.ProbeTailscale(), nil
+	})
+	writeJSON(w, probe)
+}
+
+type tsSetRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+func (s *Server) handleTSSet(w http.ResponseWriter, r *http.Request) {
+	var req tsSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetTailscale(req.Enabled)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleGuestGet(w http.ResponseWriter, _ *http.Request) {
+	probe, _ := modules.CachedRead("guestwifi", probeCacheTTL, func() (*modules.GuestProbe, error) {
+		return modules.ProbeGuest(), nil
+	})
+	writeJSON(w, probe)
+}
+
+func (s *Server) handleGuestSet(w http.ResponseWriter, r *http.Request) {
+	var cfg modules.GuestConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetGuest(cfg)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleCaptivePortalGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeCaptivePortal())
+}
+
+func (s *Server) handleCaptivePortalSet(w http.ResponseWriter, r *http.Request) {
+	var cfg modules.CaptivePortalConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetCaptivePortal(cfg)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleCaptivePortalImage(w http.ResponseWriter, r *http.Request) {
+	var img modules.CaptivePortalImage
+	if err := json.NewDecoder(r.Body).Decode(&img); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, err := modules.SetCaptivePortalImage(img)
+	writeModuleResult(w, probe, false, err)
+}
+
+type snmpSetRequest struct {
+	Enabled     bool   `json:"enabled"`
+	Location    string `json:"location"`
+	Contact     string `json:"contact"`
+	Listen      string `json:"listen"`
+	CommunityRO string `json:"community_ro"`
+	CommunityRW string `json:"community_rw"`
+}
+
+func (s *Server) handleSNMPGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeSNMP())
+}
+
+func (s *Server) handleSNMPSet(w http.ResponseWriter, r *http.Request) {
+	var req snmpSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetSNMP(modules.SNMPRequest(req))
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleMode(w http.ResponseWriter, _ *http.Request) {
+	probe, _ := modules.CachedRead("mode", probeCacheTTL, func() (*modules.ModeProbe, error) {
+		return modules.ProbeMode(), nil
+	})
+	writeJSON(w, probe)
+}
+
+type modeSetRequest struct {
+	Target  string `json:"target"`
+	Confirm bool   `json:"confirm"`
+}
+
+func (s *Server) handleModeSet(w http.ResponseWriter, r *http.Request) {
+	var req modeSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if !req.Confirm {
+		writeError(w, http.StatusBadRequest, "explicit confirmation required")
+		return
+	}
+	probe, rolledBack, err := modules.SetMode(req.Target)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleAccessGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeAccess())
+}
+
+type accessSetRequest struct {
+	// Exactly one of the following targets is applied per request.
+	Target      string             `json:"target"` // luci | ssh | panel_session
+	Luci        modules.LuciAccess `json:"luci"`
+	SSH         modules.SSHAccess  `json:"ssh"`
+	SessionTtlM int                `json:"session_ttl_minutes"`
+}
+
+func (s *Server) handleAccessSet(w http.ResponseWriter, r *http.Request) {
+	var req accessSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	switch req.Target {
+	case "luci":
+		probe, rolledBack, err := modules.SetLuciAccess(req.Luci)
+		writeModuleResult(w, probe, rolledBack, err)
+	case "ssh":
+		probe, rolledBack, err := modules.SetSSHAccess(req.SSH)
+		writeModuleResult(w, probe, rolledBack, err)
+	case "panel_session":
+		if req.SessionTtlM <= 0 {
+			writeError(w, http.StatusBadRequest, "session_ttl_minutes must be > 0")
+			return
+		}
+		if err := modules.SetPanelSessionTTL(req.SessionTtlM); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"status": "applied", "panel": modules.ProbeAccess().Panel})
+	default:
+		writeError(w, http.StatusBadRequest, "target must be luci, ssh or panel_session")
+	}
+}
+
+func (s *Server) handleRemoteGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeRemoteAccess())
+}
+
+type remoteSetRequest struct {
+	PingWAN     *bool `json:"ping_wan"`
+	RemoteHTTPS *bool `json:"remote_https"`
+	RemoteSSH   *bool `json:"remote_ssh"`
+}
+
+func (s *Server) handleRemoteSet(w http.ResponseWriter, r *http.Request) {
+	var req remoteSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetRemoteAccess(req.PingWAN, req.RemoteHTTPS, req.RemoteSSH)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleOffloadGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeOffload())
+}
+
+type offloadSetRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+func (s *Server) handleOffloadSet(w http.ResponseWriter, r *http.Request) {
+	var req offloadSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetOffload(req.Enabled)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleMDNSGet(w http.ResponseWriter, _ *http.Request) {
+	probe, _ := modules.CachedRead("mdns", probeCacheTTL, func() (*modules.MDNSProbe, error) {
+		return modules.ProbeMDNS(), nil
+	})
+	writeJSON(w, probe)
+}
+
+type mdnsSetRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+func (s *Server) handleMDNSSet(w http.ResponseWriter, r *http.Request) {
+	var req mdnsSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetMDNS(req.Enabled)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleWifiGet(w http.ResponseWriter, _ *http.Request) {
+	ui, err := modules.ProbeWifiUI()
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"interfaces": ui})
+}
+
+func (s *Server) handleWifiKey(w http.ResponseWriter, r *http.Request) {
+	section := r.URL.Query().Get("section")
+	if section == "" {
+		writeError(w, http.StatusBadRequest, "section is required")
+		return
+	}
+	writeJSON(w, map[string]any{"key": modules.WifiKey(section)})
+}
+
+func (s *Server) handleWifiSet(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		modules.WifiEdit
+		Confirm bool `json:"confirm,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	var snapshots map[string]string
+	if req.Confirm {
+		snapshots = snapshotConfigs("wireless")
+	}
+	probe, rolledBack, err := modules.SetWifi(req.WifiEdit)
+	s.finishRiskyApply(w, probe, rolledBack, err, req.Confirm, snapshots, []string{"wireless"})
+}
+
+func (s *Server) handleWifiRadioSet(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		modules.RadioEdit
+		Confirm bool `json:"confirm,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	var snapshots map[string]string
+	if req.Confirm {
+		snapshots = snapshotConfigs("wireless")
+	}
+	probe, rolledBack, err := modules.SetWifiRadio(req.RadioEdit)
+	s.finishRiskyApply(w, probe, rolledBack, err, req.Confirm, snapshots, []string{"wireless"})
+}
+
+func (s *Server) handleWifiScheduleGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{"schedules": modules.ProbeWifiSchedule()})
+}
+
+func (s *Server) handleWifiScheduleSet(w http.ResponseWriter, r *http.Request) {
+	var sched modules.WifiSchedule
+	if err := json.NewDecoder(r.Body).Decode(&sched); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetWifiSchedule(sched)
+	if err != nil && !rolledBack {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{"status": "failed", "error": err.Error()})
+		return
+	}
+	writeModuleResult(w, map[string]any{"schedules": probe}, rolledBack, err)
+}
+
+func (s *Server) handleWifiChanGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{"radios": modules.ProbeWifiChan()})
+}
+
+type wifiChanSetRequest struct {
+	Radio   string `json:"radio"`
+	Channel int    `json:"channel"`
+	Width   int    `json:"width"`
+}
+
+func (s *Server) handleWifiChanSet(w http.ResponseWriter, r *http.Request) {
+	var req wifiChanSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	radio, rolledBack, err := modules.ApplyWifiChan(req.Radio, req.Channel, req.Width)
+	if err != nil && !rolledBack {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{"status": "failed", "error": err.Error()})
+		return
+	}
+	writeModuleResult(w, radio, rolledBack, err)
+}
+
+func (s *Server) handleLANGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeLAN())
+}
+
+type lanSetRequest struct {
+	IpAddr      *string `json:"ipaddr,omitempty"`
+	Netmask     *string `json:"netmask,omitempty"`
+	ApIsolation *bool   `json:"ap_isolation,omitempty"`
+	Confirm     bool    `json:"confirm,omitempty"`
+}
+
+func (s *Server) handleLANSet(w http.ResponseWriter, r *http.Request) {
+	var req lanSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	cfg := struct {
+		IpAddr      *string `json:"ipaddr,omitempty"`
+		Netmask     *string `json:"netmask,omitempty"`
+		ApIsolation *bool   `json:"ap_isolation,omitempty"`
+	}{req.IpAddr, req.Netmask, req.ApIsolation}
+	// A LAN change (notably the panel's own IP) can cut the admin's session,
+	// so when confirm is requested we snapshot before applying and, on
+	// success, arm a revert timer that auto-restores unless the UI confirms.
+	var snapshots map[string]string
+	if req.Confirm {
+		snapshots = captureRiskySnapshots()
+	}
+	probe, rolledBack, err := modules.SetLAN(cfg)
+	s.finishRiskyApply(w, probe, rolledBack, err, req.Confirm, snapshots, []string{"network"})
+}
+
+func (s *Server) handleDHCPSet(w http.ResponseWriter, r *http.Request) {
+	var cfg modules.DHCPConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetDHCP(cfg)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+type reservationSetRequest struct {
+	MAC      string `json:"mac"`
+	IP       string `json:"ip"`
+	Name     string `json:"name,omitempty"`
+	Reserved bool   `json:"reserved"`
+}
+
+func (s *Server) handleReservationSet(w http.ResponseWriter, r *http.Request) {
+	var req reservationSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetReservation(req.MAC, req.IP, req.Name, req.Reserved)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleReservationsClear(w http.ResponseWriter, _ *http.Request) {
+	probe, rolledBack, err := modules.ClearReservations()
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleDNSGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeDNS())
+}
+
+type dnsSetRequest struct {
+	RebindProtect *bool `json:"rebind_protection,omitempty"`
+	OverrideDNS   *bool `json:"override_dns,omitempty"`
+	DnsVpn        *bool `json:"dns_vpn,omitempty"`
+	ForceDNS      *bool `json:"force_dns,omitempty"`
+}
+
+func (s *Server) handleAdGuardAction(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Action string `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	// Credential rotation (#424) returns the fresh credentials instead of
+	// the DNS probe the service actions answer with.
+	if req.Action == "regenerate-password" {
+		cred, err := modules.RegenerateAdGuardPassword()
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, cred)
+		return
+	}
+	probe, rolledBack, err := modules.AdGuardAction(req.Action)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+// handleAdGuardCredentials answers the on-demand credential view: the only
+// response that carries the AdGuard password, and only when NetGrip manages
+// it (#424).
+func (s *Server) handleAdGuardCredentials(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.AdGuardCredentialsNow())
+}
+
+func (s *Server) handleAdGuardProtection(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enable  bool `json:"enable"`
+		Confirm bool `json:"confirm"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if !req.Confirm {
+		writeError(w, http.StatusBadRequest, "confirmation required")
+		return
+	}
+	probe, rolledBack, err := modules.AdGuardProtection(req.Enable)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleAdGuardDoH(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Action    string   `json:"action"`
+		Upstreams []string `json:"upstreams"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.AdGuardDoH(req.Action, req.Upstreams)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleDNSSet(w http.ResponseWriter, r *http.Request) {
+	var req dnsSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetDNS(req.RebindProtect, req.OverrideDNS, req.DnsVpn, req.ForceDNS)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+type dnsHostsSetRequest struct {
+	IP       string `json:"ip"`
+	Hostname string `json:"hostname"`
+	Remove   bool   `json:"remove"`
+}
+
+func (s *Server) handleDNSHostsSet(w http.ResponseWriter, r *http.Request) {
+	var req dnsHostsSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetHosts(req.IP, req.Hostname, req.Remove)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleNetDev(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{"counters": modules.NetDevCounters(), "ts": time.Now().UnixMilli()})
+}
+
+func (s *Server) handleEthPorts(w http.ResponseWriter, _ *http.Request) {
+	ports, _ := modules.CachedRead("ethports", probeCacheTTL, func() ([]modules.EthPort, error) {
+		return modules.EthPorts(), nil
+	})
+	writeJSON(w, map[string]any{"ports": ports})
+}
+
+func (s *Server) handleUsteer(w http.ResponseWriter, _ *http.Request) {
+	aps, err := modules.CachedRead("usteer", probeCacheTTL, func() ([]modules.UsteerAP, error) {
+		return modules.UsteerNetwork()
+	})
+	if err != nil {
+		// usteer isn't installed on most routers; that's not a gateway
+		// failure, just an empty mesh view.
+		writeJSON(w, map[string]any{"aps": []modules.UsteerAP{}})
+		return
+	}
+	writeJSON(w, map[string]any{"aps": aps})
+}
+
+func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
+	requesterIP, _, _ := strings.Cut(r.RemoteAddr, ":")
+	// Keyed by requesterIP: the Self flag depends on who asks. ts is
+	// computed inside the cache so it stays consistent with the cached
+	// byte counters; writes invalidate via invalidateClients (#356).
+	payload, _ := modules.CachedRead("clients|"+requesterIP, probeCacheTTL, func() (map[string]any, error) {
+		return map[string]any{"clients": modules.ListClients(requesterIP), "bands": modules.AvailableBands(), "ts": time.Now().UnixMilli()}, nil
+	})
+	writeJSON(w, payload)
+}
+
+func (s *Server) handleL2Clients(w http.ResponseWriter, _ *http.Request) {
+	probe, _ := modules.CachedRead("l2clients", probeCacheTTL, func() (*modules.L2Probe, error) {
+		return modules.ProbeL2Clients(), nil
+	})
+	writeJSON(w, probe)
+}
+
+func (s *Server) handleClientsBlocked(w http.ResponseWriter, _ *http.Request) {
+	payload, _ := modules.CachedRead("clients.blocked", probeCacheTTL, func() (map[string]any, error) {
+		return map[string]any{"blocked": modules.BlockedClients(), "ts": time.Now().UnixMilli()}, nil
+	})
+	writeJSON(w, payload)
+}
+
+func (s *Server) handleClientMeta(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.GetClientMeta())
+}
+
+type setClientMetaRequest struct {
+	MAC        string `json:"mac"`
+	Name       string `json:"name"`
+	DeviceType string `json:"device_type"`
+}
+
+func (s *Server) handleSetClientMeta(w http.ResponseWriter, r *http.Request) {
+	var req setClientMetaRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	res, err := modules.SetClientMeta(req.MAC, req.Name, req.DeviceType)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, res)
+}
+
+type clientReserveRequest struct {
+	MAC      string `json:"mac"`
+	IP       string `json:"ip"`
+	Reserved bool   `json:"reserved"`
+}
+
+func (s *Server) handleClientReserve(w http.ResponseWriter, r *http.Request) {
+	var req clientReserveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	_, rolledBack, err := modules.SetClientReservation(req.MAC, req.IP, req.Reserved)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"rolled_back": rolledBack, "status": "applied"})
+}
+
+type clientBlockRequest struct {
+	MAC     string `json:"mac"`
+	Type    string `json:"type"`
+	Band    string `json:"band,omitempty"`
+	Blocked bool   `json:"blocked"`
+}
+
+func (s *Server) handleClientBlock(w http.ResponseWriter, r *http.Request) {
+	var req clientBlockRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	_, rolledBack, err := modules.SetClientBlocked(req.MAC, req.Type, req.Band, req.Blocked)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"rolled_back": rolledBack, "status": "applied"})
+}
+
+func (s *Server) handleParentalGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeParental())
+}
+
+func (s *Server) handleParentalSet(w http.ResponseWriter, r *http.Request) {
+	var req modules.ParentalRule
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	res, err := modules.SetParentalRule(req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, res)
+}
+
+func (s *Server) handleParentalDelete(w http.ResponseWriter, r *http.Request) {
+	res, err := modules.RemoveParentalRule(r.URL.Query().Get("mac"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, res)
+}
+
+// writeModuleResult is the shared response shape for write modules:
+// the new probe, whether a rollback happened, and the error if any.
+func writeModuleResult(w http.ResponseWriter, probe any, rolledBack bool, err error) {
+	result := map[string]any{"state": probe, "rolled_back": rolledBack}
+	if err != nil {
+		result["error"] = err.Error()
+		if rolledBack {
+			result["status"] = "rolled_back"
+		} else {
+			result["status"] = "failed"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(result)
+		return
+	}
+	result["status"] = "applied"
+	writeJSON(w, result)
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("write json: %v", err)
+	}
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+func (s *Server) handleSnapshotsList(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{"snapshots": modules.ListSnapshots()})
+}
+
+func (s *Server) handleSnapshotCreate(w http.ResponseWriter, _ *http.Request) {
+	snap, err := modules.CreateSnapshot()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, snap)
+}
+
+func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "id query param required")
+		return
+	}
+	if err := modules.DeleteSnapshot(id); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleSnapshotDiff(w http.ResponseWriter, r *http.Request) {
+	from := r.URL.Query().Get("from")
+	to := r.URL.Query().Get("to")
+	if from == "" || to == "" {
+		writeError(w, http.StatusBadRequest, "from and to query params required")
+		return
+	}
+	diffs, err := modules.DiffSnapshots(from, to)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"diffs": diffs})
+}
+
+type rollbackRequest struct {
+	ID string `json:"id"`
+}
+
+func (s *Server) handleSnapshotRollback(w http.ResponseWriter, r *http.Request) {
+	var req rollbackRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" {
+		writeError(w, http.StatusBadRequest, "snapshot id required")
+		return
+	}
+	if err := modules.RollbackSnapshot(req.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "applied"})
+}
+
+func (s *Server) handleSnapshotExport(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "id query param required")
+		return
+	}
+	data, err := modules.ExportSnapshot(id)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/gzip")
+	w.Header().Set("Content-Disposition", "attachment; filename=\"netgrip-snapshot-"+id+".tar.gz\"")
+	w.Write(data)
+}
+
+type bounceRequest struct {
+	Iface string `json:"iface"`
+}
+
+func (s *Server) handlePortBounce(w http.ResponseWriter, r *http.Request) {
+	var req bounceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Iface == "" {
+		writeError(w, http.StatusBadRequest, "iface required")
+		return
+	}
+	result, err := modules.BounceLink(req.Iface)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, result)
+}
+
+type blockRequest struct {
+	Iface   string `json:"iface"`
+	Blocked bool   `json:"blocked"`
+}
+
+func (s *Server) handlePortBlock(w http.ResponseWriter, r *http.Request) {
+	var req blockRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Iface == "" {
+		writeError(w, http.StatusBadRequest, "iface required")
+		return
+	}
+	result, err := modules.BlockPort(req.Iface, req.Blocked)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, result)
+}
+
+func (s *Server) handleIGMPGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeIGMP())
+}
+
+type igmpSetRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+func (s *Server) handleIGMPSet(w http.ResponseWriter, r *http.Request) {
+	var req igmpSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, err := modules.SetIGMP(req.Enabled)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, probe)
+}
+
+func (s *Server) handleLoops(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.DetectLoops())
+}
+
+// probeCacheTTL is the read cache lifetime for the Overview probes.
+// Short enough that live state (rates, tunnel status) stays fresh, long
+// enough that the parallel burst of the page load forks each probe once
+// instead of once per card (#356).
+const probeCacheTTL = 2 * time.Second
+
+// selfUpdateCheckTTL caches the GitHub release check: it is the only
+// probe with network latency (hundreds of ms to api.github.com) and the
+// Overview polls it like any other card (#356). ?refresh=1 bypasses the
+// cache for a manual check. The scheduler and the apply path call
+// CheckSelfUpdate directly, so they always check fresh.
+const selfUpdateCheckTTL = 5 * time.Minute
+
+func (s *Server) handleSelfUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("refresh") == "1" {
+		modules.InvalidateKey("selfupdate.check")
+	}
+	check, _ := modules.CachedRead("selfupdate.check", selfUpdateCheckTTL, func() (*modules.SelfUpdateCheck, error) {
+		return modules.CheckSelfUpdate(s.version), nil
+	})
+	writeJSON(w, check)
+}
+
+// handleAnnouncement expone el aviso vigente (announcements.json del repo,
+// refrescado por modules.StartAnnouncements). Sin aviso: {active:false}.
+func (s *Server) handleAnnouncement(w http.ResponseWriter, _ *http.Request) {
+	a := modules.GetActiveAnnouncement()
+	if a == nil {
+		writeJSON(w, map[string]any{"active": false})
+		return
+	}
+	writeJSON(w, map[string]any{"active": true, "announcement": a})
+}
+
+func (s *Server) handleSelfUpdateStatus(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.GetSelfUpdateStatus())
+}
+
+type selfUpdateApplyRequest struct {
+	Confirm bool `json:"confirm"`
+}
+
+func (s *Server) handleSelfUpdateApply(w http.ResponseWriter, r *http.Request) {
+	var req selfUpdateApplyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !req.Confirm {
+		writeError(w, http.StatusBadRequest, "explicit confirmation required")
+		return
+	}
+	if err := modules.StartSelfUpdate(s.version); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	// The version is about to change; never serve the pre-update check again.
+	modules.InvalidateKey("selfupdate.check")
+	writeJSON(w, map[string]string{"status": "started"})
+}
+
+func (s *Server) handleSelfUpdateSchedule(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.SelfUpdateScheduleStatus{
+		Config: modules.ReadSelfUpdateConfig(),
+		State:  modules.SelfUpdateScheduleStateOf(),
+		Status: modules.GetSelfUpdateStatus(),
+	})
+}
+
+type selfUpdateScheduleRequest struct {
+	Enabled     *bool `json:"enabled"`
+	IntervalH   *int  `json:"intervalHours"`
+	WindowStart *int  `json:"windowStart"`
+	WindowEnd   *int  `json:"windowEnd"`
+}
+
+func (s *Server) handleSelfUpdateSchedulePut(w http.ResponseWriter, r *http.Request) {
+	var req selfUpdateScheduleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_body")
+		return
+	}
+	cfg := modules.ReadSelfUpdateConfig()
+	if req.Enabled != nil {
+		cfg.Enabled = *req.Enabled
+	}
+	if req.IntervalH != nil {
+		cfg.IntervalH = *req.IntervalH
+	}
+	if req.WindowStart != nil {
+		cfg.WindowStart = *req.WindowStart
+	}
+	if req.WindowEnd != nil {
+		cfg.WindowEnd = *req.WindowEnd
+	}
+	cfg, err := modules.WriteSelfUpdateConfig(cfg)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, cfg)
+}
+
+func (s *Server) handleWizardGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeWizard())
+}
+
+func (s *Server) handleWizardComplete(w http.ResponseWriter, _ *http.Request) {
+	if err := modules.CompleteWizard(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	modules.CreateSnapshot()
+	writeJSON(w, map[string]string{"status": "completed"})
+}
+
+func (s *Server) handleWizardReset(w http.ResponseWriter, _ *http.Request) {
+	if err := modules.ResetWizard(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, modules.ProbeWizard())
+}
+
+func (s *Server) handleDriftGet(w http.ResponseWriter, _ *http.Request) {
+	probe, _ := modules.CachedRead("drift", probeCacheTTL, func() (*modules.DriftProbe, error) {
+		return modules.ProbeDrift(), nil
+	})
+	writeJSON(w, probe)
+}
+
+func (s *Server) handleVLANsGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeVLANs())
+}
+
+func (s *Server) handleVLANsSet(w http.ResponseWriter, r *http.Request) {
+	var edit modules.VLANEdit
+	if err := json.NewDecoder(r.Body).Decode(&edit); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetVLAN(edit)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+type vlanDeleteRequest struct {
+	VID int `json:"vid"`
+}
+
+func (s *Server) handleVLANsDelete(w http.ResponseWriter, r *http.Request) {
+	var req vlanDeleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.DeleteVLAN(req.VID)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleSTPGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeSTP())
+}
+
+// Los setters STP validan antes de escribir; lo que llega aqui es un error
+// de validacion o del kernel, y en ambos casos el mensaje limpio sale como
+// 400: es un fallo del trabajo pedido, no del panel.
+func (s *Server) handleSTPBridgeSet(w http.ResponseWriter, r *http.Request) {
+	var edit modules.STPBridgeEdit
+	if err := json.NewDecoder(r.Body).Decode(&edit); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.SetSTPBridge(edit); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "applied"})
+}
+
+func (s *Server) handleSTPPortSet(w http.ResponseWriter, r *http.Request) {
+	var edit modules.STPPortEdit
+	if err := json.NewDecoder(r.Body).Decode(&edit); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.SetSTPPort(edit); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "applied"})
+}
+
+func (s *Server) handlePhysPortsGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbePhysPorts())
+}
+
+func (s *Server) handlePhysPortSet(w http.ResponseWriter, r *http.Request) {
+	var edit modules.PhysPortEdit
+	if err := json.NewDecoder(r.Body).Decode(&edit); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.SetPhysPort(edit); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "applied"})
+}
+
+func (s *Server) handleLAGGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeLAGs())
+}
+
+func (s *Server) handleLAGSet(w http.ResponseWriter, r *http.Request) {
+	var cfg modules.LAGConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetLAG(cfg)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+type lagDeleteRequest struct {
+	Name string `json:"name"`
+}
+
+func (s *Server) handleLAGDelete(w http.ResponseWriter, r *http.Request) {
+	var req lagDeleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.DeleteLAG(req.Name)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleHistoryGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{"entries": modules.GetHistory()})
+}
+
+func (s *Server) handleHTTPSGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{
+		"has_cert": modules.HasSelfSignedCert(),
+		// cert: which pair is configured, and whether the router's is even
+		// available to choose.
+		"cert":        modules.CertSource(),
+		"router_cert": modules.HasRouterCert(),
+		// enabled is what the configuration says; serving is how this
+		// process was started. Between a change and the restart that
+		// applies it the two differ, and the UI has to be able to say so.
+		"enabled": modules.HTTPSEnabled(),
+		"serving": s.secure,
+		// serving_cert is the pair this process actually opened, and
+		// serving_source names it. Configured and served differ whenever a
+		// configured pair was missing and the panel fell back.
+		"serving_cert":   s.servingCert,
+		"serving_source": servingSource(s.servingCert),
+	})
+}
+
+type httpsRequest struct {
+	Enabled *bool `json:"enabled"`
+	// Cert: "panel" (the panel's own pair, with the router's addresses in
+	// the SAN) or "router" (uhttpd's, the same one LuCI serves). Empty
+	// keeps whatever was already configured.
+	Cert string `json:"cert"`
+}
+
+// handleHTTPSSet turns the panel's own TLS on or off. It takes effect on the
+// restart it schedules: the listener cannot change scheme underneath the
+// request that asked for it.
+func (s *Server) handleHTTPSSet(w http.ResponseWriter, r *http.Request) {
+	var req httpsRequest
+	// An empty body means enable, which is what POST /api/https did before
+	// it could also turn TLS off.
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	enable := req.Enabled == nil || *req.Enabled
+
+	// Nothing to do is not a reason to restart the panel. The running
+	// state has to agree as well as the configuration: between a change
+	// and the restart that applies it the two differ, and that gap is
+	// exactly when the restart is still owed.
+	if s.secure == enable && modules.HTTPSEnabled() == enable &&
+		(!enable || req.Cert == "" || req.Cert == modules.CertSource()) {
+		writeJSON(w, map[string]any{"status": "unchanged", "https": enable, "restarting": false})
+		return
+	}
+
+	if !enable {
+		if err := modules.DisableHTTPS(); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		s.respondHTTPSChange(w, false)
+		return
+	}
+
+	source := req.Cert
+	switch source {
+	case "":
+		source = modules.CertSource()
+	case modules.CertSourcePanel, modules.CertSourceRouter, modules.CertSourceCustom:
+	default:
+		// Anything else used to mean "panel", so a typo silently generated
+		// and installed a new pair.
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("unknown certificate source %q; expected %q, %q or %q",
+				source, modules.CertSourcePanel, modules.CertSourceRouter, modules.CertSourceCustom))
+		return
+	}
+
+	// What to go back to if the new configuration turns out not to serve.
+	// Restoring it is not the same as turning HTTPS off: on a panel already
+	// serving TLS, disabling it was a second state change that left the
+	// process on HTTPS and the configuration on plaintext.
+	prevEnabled := modules.HTTPSEnabled()
+	prevCert, prevKey := modules.HTTPSCertPaths()
+
+	if err := modules.EnableHTTPS(source); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Refuse to restart into a configuration that cannot serve. Without
+	// this, a pair that does not load takes the panel down on restart and
+	// the only way back is the command line - from a button whose whole
+	// point is not needing one.
+	//
+	// The check is OpenCertificate, the very call the next process will
+	// make, and not a stricter one: a preflight that refuses what startup
+	// would have accepted reports an impossibility that is not there.
+	certFile, keyFile := modules.HTTPSCertPaths()
+	if _, used, err := OpenCertificate(certFile, keyFile); err != nil {
+		if rerr := modules.RestoreHTTPSConfig(prevEnabled, prevCert, prevKey); rerr != nil {
+			log.Printf("https: restoring the previous configuration failed: %v", rerr)
+		}
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("no usable certificate for %s, configuration left as it was: %v", certFile, err))
+		return
+	} else if used != certFile {
+		log.Printf("https: %s could not be opened, the panel will serve %s", certFile, used)
+	}
+	s.respondHTTPSChange(w, true)
+}
+
+// respondHTTPSChange answers, then restarts the panel so the new scheme
+// takes effect. The sleep is what lets the answer reach the browser: the
+// process serving it is the one going away.
+func (s *Server) respondHTTPSChange(w http.ResponseWriter, https bool) {
+	status := "disabled"
+	if https {
+		status = "enabled"
+	}
+	// The transport is changing, so every session issued under the old one
+	// dies with it. This matters in the plaintext-to-TLS direction: those
+	// tokens crossed the LAN in clear and may have been read off it, and
+	// without this they would be carried over and promoted into the Secure
+	// cookie - protected in transit from then on, but belonging to whoever
+	// captured them. Everyone logs in again on the new scheme, which is
+	// what the change of address asks of them anyway.
+	if https != s.secure {
+		auth.BumpEpoch()
+	}
+	writeJSON(w, map[string]any{"status": status, "https": https, "restarting": true})
+	go func() {
+		time.Sleep(700 * time.Millisecond)
+		// Logged, not discarded. This is the one step nothing else can
+		// report on: the process that would notice the failure is the one
+		// being replaced, and the browser has already been answered. A
+		// missing init script left no trace anywhere at all.
+		if err := executor.Run(executor.Op{Kind: "initd", Args: []string{"netgrip", "restart"}}); err != nil {
+			log.Printf("https: restart failed, the panel is still on the old scheme: %v", err)
+		}
+	}()
+}
+
+type wolRequest struct {
+	MAC string `json:"mac"`
+}
+
+func (s *Server) handleWoL(w http.ResponseWriter, r *http.Request) {
+	var req wolRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.MAC == "" {
+		writeError(w, http.StatusBadRequest, "mac required")
+		return
+	}
+	if err := modules.WakeOnLAN(req.MAC); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "sent"})
+}
+
+// handleCPUGet: per-core load, clock, temperature and the packet-drop
+// counters. Cheap enough to poll: only /proc and /sys reads.
+func (s *Server) handleCPUGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeCPU())
+}
+
+func (s *Server) handleNlbwmonGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeNlbwmon())
+}
+
+// handleNlbwmonTopGet: who used the most, by device and by protocol.
+//
+// The only per-device accounting a gateway has. The wireless counters in
+// Client cover just the stations associated to this router, so on a gateway
+// whose clients sit behind a switch they are always empty; nlbwmon sees
+// every flow. Empty lists when it is not installed — the UI then falls back
+// to what it showed before.
+func (s *Server) handleNlbwmonTopGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{
+		"devices": modules.NlbwmonTopDevices(8),
+		"apps":    modules.NlbwmonTopApps(8),
+	})
+}
+
+func (s *Server) handleNlbwmonSet(w http.ResponseWriter, r *http.Request) {
+	var cfg modules.NlbwmonConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetNlbwmon(cfg)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleFirewallGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeFirewall())
+}
+
+func (s *Server) handleFirewallAddRule(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		modules.FirewallRuleAdd
+		Confirm bool `json:"confirm,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	var snapshots map[string]string
+	if req.Confirm {
+		snapshots = snapshotConfigs("firewall")
+	}
+	probe, rolledBack, err := modules.AddFirewallRule(req.FirewallRuleAdd)
+	s.finishRiskyApply(w, probe, rolledBack, err, req.Confirm, snapshots, []string{"firewall"})
+}
+
+type fwDeleteRequest struct {
+	Section string `json:"section"`
+	Confirm bool   `json:"confirm,omitempty"`
+}
+
+func (s *Server) handleFirewallDelRule(w http.ResponseWriter, r *http.Request) {
+	var req fwDeleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Section == "" {
+		writeError(w, http.StatusBadRequest, "section required")
+		return
+	}
+	var snapshots map[string]string
+	if req.Confirm {
+		snapshots = snapshotConfigs("firewall")
+	}
+	probe, rolledBack, err := modules.DeleteFirewallRule(req.Section)
+	s.finishRiskyApply(w, probe, rolledBack, err, req.Confirm, snapshots, []string{"firewall"})
+}
+
+func (s *Server) handleTemplatesGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{"templates": modules.ListTemplates()})
+}
+
+type templateApplyRequest struct {
+	ID      string `json:"id"`
+	Confirm bool   `json:"confirm"`
+}
+
+func (s *Server) handleTemplatesApply(w http.ResponseWriter, r *http.Request) {
+	var req templateApplyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" {
+		writeError(w, http.StatusBadRequest, "template id required")
+		return
+	}
+	// Destructive templates require explicit confirmation
+	for _, t := range modules.ListTemplates() {
+		if t.ID == req.ID && t.Destructive && !req.Confirm {
+			writeError(w, http.StatusBadRequest, "destructive template requires confirm=true")
+			return
+		}
+	}
+	if err := modules.ApplyTemplate(req.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "applied"})
+}
+
+func (s *Server) handleSwitchGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeSwitchPorts())
+}
+
+func (s *Server) handleSwitchSet(w http.ResponseWriter, r *http.Request) {
+	var edit modules.SwitchPortEdit
+	if err := json.NewDecoder(r.Body).Decode(&edit); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetSwitchPort(edit)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handlePortStatsGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbePortStats())
+}
+
+func (s *Server) handleSwitchModesGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{"modes": modules.ListSwitchModes()})
+}
+
+type switchModeApplyRequest struct {
+	ID         string `json:"id"`
+	UplinkPort string `json:"uplink_port"`
+	Confirm    bool   `json:"confirm"`
+}
+
+func (s *Server) handleSwitchModesApply(w http.ResponseWriter, r *http.Request) {
+	var req switchModeApplyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" {
+		writeError(w, http.StatusBadRequest, "mode id required")
+		return
+	}
+	if !req.Confirm {
+		writeError(w, http.StatusBadRequest, "explicit confirmation required (confirm=true)")
+		return
+	}
+	if err := modules.ApplySwitchMode(req.ID, req.UplinkPort); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "applied"})
+}
+
+func (s *Server) handlePoEGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbePoE())
+}
+
+func (s *Server) handlePoESchedule(w http.ResponseWriter, r *http.Request) {
+	var sched modules.PoESchedule
+	if err := json.NewDecoder(r.Body).Decode(&sched); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, err := modules.SetPoESchedule(sched)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"status": "applied", "state": probe})
+}
+
+func (s *Server) handlePoEWatchdogGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{"watchdogs": modules.ProbePoEWatchdogs()})
+}
+
+func (s *Server) handlePoEWatchdogSet(w http.ResponseWriter, r *http.Request) {
+	var cfg modules.PoEWatchdogConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	states, err := modules.SetPoEWatchdog(cfg)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"status": "applied", "watchdogs": states})
+}
+
+func (s *Server) handlePortTemplatesGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{"templates": modules.ListPortTemplates()})
+}
+
+func (s *Server) handlePortTemplatesSave(w http.ResponseWriter, r *http.Request) {
+	var tpl modules.PortTemplateSave
+	if err := json.NewDecoder(r.Body).Decode(&tpl); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.SavePortTemplate(tpl); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "saved"})
+}
+
+type portTemplateDeleteRequest struct {
+	Name string `json:"name"`
+}
+
+func (s *Server) handlePortTemplatesDelete(w http.ResponseWriter, r *http.Request) {
+	var req portTemplateDeleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		writeError(w, http.StatusBadRequest, "name required")
+		return
+	}
+	if err := modules.DeletePortTemplate(req.Name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "deleted"})
+}
+
+func (s *Server) handlePortTemplatesApply(w http.ResponseWriter, r *http.Request) {
+	var req modules.PortTemplateApply
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.ApplyPortTemplate(req); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "applied"})
+}
+
+func (s *Server) handleRolesGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{"roles": modules.ListRoleProfiles()})
+}
+
+func (s *Server) handleRolesApply(w http.ResponseWriter, r *http.Request) {
+	var req modules.RoleApply
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.ApplyRoleProfile(req); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "applied"})
+}
+
+func (s *Server) handleDPIGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeDPI())
+}
+func (s *Server) handleDPIAppsGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{"apps": modules.NetifydApps()})
+}
+func (s *Server) handleDPITimelineGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.NetifydTimeline())
+}
+
+func (s *Server) handleNetifydGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeNetifyd())
+}
+
+type netifydSetRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+func (s *Server) handleNetifydSet(w http.ResponseWriter, r *http.Request) {
+	var req netifydSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetNetifyd(req.Enabled)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleFleetGet(w http.ResponseWriter, _ *http.Request) {
+	nodes, err := modules.ListFleet()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"nodes": nodes})
+}
+
+func (s *Server) handleFleetAdd(w http.ResponseWriter, r *http.Request) {
+	var node modules.FleetNode
+	if err := json.NewDecoder(r.Body).Decode(&node); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if node.ID == "" || node.Name == "" || node.Address == "" {
+		writeError(w, http.StatusBadRequest, "id, name and address required")
+		return
+	}
+	if err := modules.AddFleetNode(node); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "added"})
+}
+
+func (s *Server) handleFleetDelete(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.RemoveFleetNode(req.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "deleted"})
+}
+
+func (s *Server) handleFleetCheck(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	status, err := modules.CheckFleetNode(req.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, status)
+}
+
+func (s *Server) handleFleetCheckAll(w http.ResponseWriter, _ *http.Request) {
+	nodes, err := modules.CheckAllFleet()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"nodes": nodes})
+}
+
+func (s *Server) handleFleetUpdate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.UpdateFleetNode(req.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "updating"})
+}
+
+func (s *Server) handleFleetDiscovered(w http.ResponseWriter, _ *http.Request) {
+	peers, err := modules.ListDiscoveredFleetPeers()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"peers": peers})
+}
+
+func (s *Server) handleFleetAdopt(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID       string `json:"id"`
+		Name     string `json:"name"`
+		Address  string `json:"address"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.AdoptFleetPeer(req.ID, req.Name, req.Address, req.Password); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "adopted"})
+}
+
+func (s *Server) handleFleetDiscoveryConfigGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]bool{"enabled": modules.FleetDiscoveryEnabled()})
+}
+
+func (s *Server) handleFleetDiscoveryConfigSet(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.SetFleetDiscoveryEnabled(req.Enabled); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]bool{"enabled": req.Enabled})
+}
+
+func (s *Server) handleCableTestGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeCableTest())
+}
+
+func (s *Server) handleStormGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeStormControl())
+}
+
+func (s *Server) handleStormSet(w http.ResponseWriter, r *http.Request) {
+	var req modules.StormSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.SetStormControl(req); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "applied"})
+}
+
+func (s *Server) handleMirrorGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeMirror())
+}
+
+// handleManagementPortGet sirve solo la boca de gestion deducida, barato
+// frente al probe de espejo completo: el badge del chasis lo pide de forma
+// perezosa tras el primer pintado (#543).
+func (s *Server) handleManagementPortGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeManagementPort())
+}
+
+func (s *Server) handleMirrorSet(w http.ResponseWriter, r *http.Request) {
+	var req modules.MirrorSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.SetMirror(req); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "applied"})
+}
+
+func (s *Server) handleRateGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeRateLimit())
+}
+
+func (s *Server) handleRateSet(w http.ResponseWriter, r *http.Request) {
+	var req modules.RateSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.SetRateLimit(req); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "applied"})
+}
+
+func (s *Server) handleStorageGet(w http.ResponseWriter, _ *http.Request) {
+	probe, _ := modules.CachedRead("storage", probeCacheTTL, func() (modules.StorageProbe, error) {
+		return modules.ProbeStorage(), nil
+	})
+	writeJSON(w, probe)
+}
+
+func (s *Server) handleStorageSet(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name   string `json:"name"`
+		Action string `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.SetStorageService(req.Name, req.Action); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "applied"})
+}
+
+func (s *Server) handleMACACLGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeMACACL())
+}
+
+func (s *Server) handlePortIsolationGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbePortIsolation())
+}
+
+func (s *Server) handlePortIsolationSet(w http.ResponseWriter, r *http.Request) {
+	var req modules.PortIsolationSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.SetPortIsolation(req); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "applied"})
+}
+
+func (s *Server) handlePortSecurityGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbePortSecurity())
+}
+
+func (s *Server) handlePortSecurityLearningSet(w http.ResponseWriter, r *http.Request) {
+	var req modules.PortSecurityLearningRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.SetPortLearning(req); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "applied"})
+}
+
+func (s *Server) handlePortSecurityFdbSet(w http.ResponseWriter, r *http.Request) {
+	var req modules.PortSecurityFdbRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.SetPortStaticMAC(req); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "applied"})
+}
+
+func (s *Server) handleMACACLSet(w http.ResponseWriter, r *http.Request) {
+	var req modules.MACACLSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.SetMACACL(req); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "applied"})
+}
+
+// netPulseState is the shared GET/POST response shape. The agent token is
+// NEVER included (write-only from the UI).
+func netPulseState() map[string]any {
+	info := modules.NetPulseInfoNow()
+	var lastPush any
+	if !info.Status.LastPush.IsZero() {
+		lastPush = info.Status.LastPush.UTC().Format(time.RFC3339)
+	}
+	var standaloneReplacedAt any
+	if !info.StandaloneReplacedAt.IsZero() {
+		standaloneReplacedAt = info.StandaloneReplacedAt.UTC().Format(time.RFC3339)
+	}
+	var lastDiscovery any
+	if !info.Discovery.LastDiscovery.IsZero() {
+		lastDiscovery = info.Discovery.LastDiscovery.UTC().Format(time.RFC3339)
+	}
+	return map[string]any{
+		"enabled":    info.Enabled,
+		"configured": info.Configured,
+		"server":     info.Server,
+		"slug":       info.Slug,
+		"phase":      info.Phase,
+		"discovery": map[string]any{
+			"foundServer":     info.Discovery.FoundServer,
+			"lastDiscoveryAt": lastDiscovery,
+			"lastEnrollNote":  info.Discovery.LastEnrollNote,
+		},
+		"standaloneReplacedAt": standaloneReplacedAt,
+		"status": map[string]any{
+			"running":   info.Status.Running,
+			"pushOk":    info.Status.PushOk,
+			"lastPush":  lastPush,
+			"lastError": info.Status.LastError,
+		},
+	}
+}
+
+func (s *Server) handleNetPulseGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, netPulseState())
+}
+
+type netPulseSetRequest struct {
+	Server    string `json:"server"`
+	Slug      string `json:"slug"`
+	Token     string `json:"token"`
+	Enabled   bool   `json:"enabled"`
+	ServerFP  string `json:"serverFp"`
+	Interval  string `json:"interval"`
+	WanTarget string `json:"wanTarget"`
+	GwTarget  string `json:"gwTarget"`
+}
+
+func (s *Server) handleNetPulseSet(w http.ResponseWriter, r *http.Request) {
+	var req netPulseSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	// Validate target fields whenever they are provided (or when enabling).
+	if req.Server != "" || req.Slug != "" || req.Enabled {
+		if err := modules.ValidateNetPulseTarget(req.Server, req.Slug); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	// Token is optional on update: keep the stored one when empty, but a
+	// first enable needs one to actually push.
+	if req.Token == "" && req.Enabled {
+		if old, err := modules.ReadNetPulseConfig("/etc/netgrip/netpulse.env"); err != nil || old.Token == "" {
+			writeError(w, http.StatusBadRequest, "token required")
+			return
+		}
+	}
+	cfg := modules.NetPulseConfig{
+		Server:    req.Server,
+		Slug:      req.Slug,
+		Token:     req.Token,
+		ServerFP:  req.ServerFP,
+		Interval:  req.Interval,
+		WanTarget: req.WanTarget,
+		GwTarget:  req.GwTarget,
+		Enabled:   req.Enabled,
+	}
+	if err := modules.SetNetPulseConfig(cfg); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, netPulseState())
+}
+
+func (s *Server) handleMQTTGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.MQTTInfoNow())
+}
+
+type mqttSetRequest struct {
+	Enabled     bool   `json:"enabled"`
+	Host        string `json:"host"`
+	Port        int    `json:"port"`
+	User        string `json:"user"`
+	Pass        string `json:"pass"`
+	NodeID      string `json:"nodeId"`
+	Interval    int    `json:"interval"`
+	TLS         bool   `json:"tls"`
+	TLSInsecure bool   `json:"tlsInsecure"`
+}
+
+func (s *Server) handleMQTTSet(w http.ResponseWriter, r *http.Request) {
+	var req mqttSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	cfg := modules.MQTTConfig{
+		Enabled:     req.Enabled,
+		Host:        req.Host,
+		Port:        req.Port,
+		User:        req.User,
+		Pass:        req.Pass,
+		NodeID:      req.NodeID,
+		Interval:    req.Interval,
+		TLS:         req.TLS,
+		TLSInsecure: req.TLSInsecure,
+	}
+	if err := modules.SetMQTTConfig(cfg); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, modules.MQTTInfoNow())
+}
+
+// handleMQTTTest prueba los valores del formulario contra el broker sin
+// guardarlos (#409).
+func (s *Server) handleMQTTTest(w http.ResponseWriter, r *http.Request) {
+	var req mqttSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	cfg := modules.MQTTConfig{
+		Host: req.Host, Port: req.Port, User: req.User, Pass: req.Pass,
+		TLS: req.TLS, TLSInsecure: req.TLSInsecure,
+	}
+	if err := modules.MQTTTestConnection(cfg); err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleReboot(w http.ResponseWriter, _ *http.Request) {
+	if err := modules.RebootRouter(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"started": true})
+}
+
+func (s *Server) handleNftQoSGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeNftQoS())
+}
+
+func (s *Server) handleNftQoSSet(w http.ResponseWriter, r *http.Request) {
+	var req modules.NftQoSSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetNftQoSLimit(req)
+	if err != nil {
+		if rolledBack {
+			writeError(w, http.StatusInternalServerError, err.Error())
+		} else {
+			writeError(w, http.StatusBadRequest, err.Error())
+		}
+		return
+	}
+	writeJSON(w, probe)
+}
+
+func (s *Server) handleNftQoSDelete(w http.ResponseWriter, r *http.Request) {
+	mac := r.URL.Query().Get("mac")
+	if mac == "" {
+		writeError(w, http.StatusBadRequest, "mac required")
+		return
+	}
+	probe, rolledBack, err := modules.RemoveNftQoSLimit(mac)
+	if err != nil {
+		if rolledBack {
+			writeError(w, http.StatusInternalServerError, err.Error())
+		} else {
+			writeError(w, http.StatusBadRequest, err.Error())
+		}
+		return
+	}
+	writeJSON(w, probe)
+}
+
+func (s *Server) handleQuotaGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeQuota())
+}
+
+func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
+	var req modules.Quota
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, err := modules.SetQuota(req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, probe)
+}
+
+func (s *Server) handleQuotaDelete(w http.ResponseWriter, r *http.Request) {
+	mac := r.URL.Query().Get("mac")
+	if mac == "" {
+		writeError(w, http.StatusBadRequest, "mac required")
+		return
+	}
+	probe, err := modules.RemoveQuota(mac)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, probe)
+}
+
+func (s *Server) handleExecutorToken(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]string{"token": modules.GetExecutorToken()})
+}
+
+func (s *Server) handleExecutorApply(w http.ResponseWriter, r *http.Request) {
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") || !modules.ValidateExecutorToken(strings.TrimPrefix(auth, "Bearer ")) {
+		writeError(w, http.StatusUnauthorized, "invalid or missing executor token")
+		return
+	}
+	var req modules.ExecutorRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	resp := modules.ExecuteOps(req)
+	if !resp.Ok {
+		writeJSON(w, resp)
+		return
+	}
+	writeJSON(w, resp)
+}
+
+func (s *Server) handlePushConfigGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.GetPushConfig())
+}
+
+// handleAgentRestart restarts the embedded NetPulse agent. Accepts either a
+// local session (UI) or the executor Bearer token, so the NetPulse server can
+// trigger it remotely.
+func (s *Server) handleAgentRestart(w http.ResponseWriter, r *http.Request) {
+	authorized := false
+	// Through the same helper as every other handler: reading one
+	// hardcoded name meant this endpoint stopped recognising a UI session
+	// the moment the cookie's name followed the transport.
+	if c, _, err := s.sessionCookie(r); err == nil && auth.ValidSessionToken(c.Value) && !s.isRevoked(c.Value) {
+		authorized = true
+	}
+	if !authorized {
+		authH := r.Header.Get("Authorization")
+		if strings.HasPrefix(authH, "Bearer ") && modules.ValidateExecutorToken(strings.TrimPrefix(authH, "Bearer ")) {
+			authorized = true
+		}
+	}
+	if !authorized {
+		writeError(w, http.StatusUnauthorized, "login required")
+		return
+	}
+	if err := modules.RestartNetPulseAgent(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handlePushConfigSet(w http.ResponseWriter, r *http.Request) {
+	var cfg modules.PushConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := modules.SetPushConfig(cfg); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "saved"})
+}
+
+func (s *Server) handlePushSnapshot(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.PushLatestSnapshot())
+}
+
+func (s *Server) handleLanServicesGet(w http.ResponseWriter, _ *http.Request) {
+	probe, err := modules.ListLanServices()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, probe)
+}
+
+func (s *Server) handleLanServicesPost(w http.ResponseWriter, r *http.Request) {
+	var svc modules.LanService
+	if err := json.NewDecoder(r.Body).Decode(&svc); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, err := modules.UpsertLanService(svc)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, probe)
+}
+
+func (s *Server) handleLanServicesDiscover(w http.ResponseWriter, _ *http.Request) {
+	result, err := modules.DiscoverLanServices()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, result)
+}
+
+func (s *Server) handleLanServicesDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "id query param required")
+		return
+	}
+	if err := modules.DeleteLanService(id); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// servingSource names the pair actually on the wire, which is not always the
+// configured one: the listener falls back when the configured pair cannot be
+// opened, and the card has to say so rather than repeat the configuration.
+func servingSource(path string) string {
+	routerCert, _ := routerPair()
+	panelCert, _ := panelPair()
+	switch path {
+	case "":
+		return ""
+	case panelCert:
+		return modules.CertSourcePanel
+	case routerCert:
+		return modules.CertSourceRouter
+	default:
+		return modules.CertSourceCustom
+	}
+}

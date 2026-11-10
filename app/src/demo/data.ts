@@ -1,0 +1,956 @@
+import type * as T from "../types";
+
+/**
+ * Escenario demo §9.2 — familia García. Un único mundo consistente que se
+ * comparte entre TODAS las páginas. Estado mutable: los writes del modo
+ * demo actualizan estos objetos para que la UI reaccione de forma coherente.
+ */
+
+const MIB = 1048576;
+const now = () => Math.floor(Date.now() / 1000);
+
+export const demoBoard: T.Board = {
+  model: "Redmi AX6 (IPQ807x)",
+  hostname: "casa",
+  kernel: "6.6.89",
+  release: { distribution: "OpenWrt", version: "25.12.5", revision: "r28417" },
+};
+
+export const demoSystem: T.SystemInfo = {
+  uptime: 12 * 86400 + 4 * 3600,
+  load: [0.42, 0.38, 0.31],
+  // RAM 148/395 MB (37 % usada)
+  memory: {
+    total: 395 * MIB,
+    free: 96 * MIB,
+    available: 247 * MIB,
+    cached: 88 * MIB,
+    buffered: 12 * MIB,
+  },
+  // root en kB: 96/128 MB (75 % libre)
+  root: { total: 128 * 1024, free: 96 * 1024 },
+};
+
+export const demoWan: T.WanStatus = {
+  present: true,
+  up: true,
+  uptime: 3 * 86400 + 1 * 3600,
+  ipv4: ["82.158.44.21"],
+  gateway: "82.158.44.1",
+  dns: ["1.1.1.1", "9.9.9.9"],
+};
+
+export const demoWireless: T.WirelessRadio[] = [
+  {
+    name: "radio0", up: true, band: "2g", channel: "6", htmode: "HE40", txpower: 20,
+    interfaces: [
+      { ifname: "phy0-ap0", ssid: "CasaGarcia", encryption: "sae-mixed", disabled: false, hidden: false, bssid: "8C:53:C3:11:22:30", rname: "radio0", clients: [{ mac: "3A:7B:1C:44:20:11", signal: -58 }] },
+      { ifname: "phy0-ap1", ssid: "CasaGarcia-Invitados", encryption: "sae-mixed", disabled: false, hidden: false, bssid: "8C:53:C3:11:22:31", rname: "radio0", clients: [{ mac: "FA:22:9C:71:08:55", signal: -66 }] },
+      { ifname: "phy0-ap2", ssid: "CasaGarcia-IoT", encryption: "psk2", disabled: false, hidden: false, bssid: "8C:53:C3:11:22:32", rname: "radio0", clients: [{ mac: "B4:E6:2D:90:14:07", signal: -61 }, { mac: "C8:2B:96:33:77:19", signal: -72 }, { mac: "DC:A6:32:08:51:90", signal: -69 }] },
+    ],
+  },
+  {
+    name: "radio1", up: true, band: "5g", channel: "44", htmode: "HE80", txpower: 23,
+    interfaces: [
+      { ifname: "phy1-ap0", ssid: "CasaGarcia", encryption: "sae-mixed", disabled: false, hidden: false, bssid: "8C:53:C3:11:22:40", rname: "radio1", clients: [{ mac: "9C:B6:D0:12:AB:77", signal: -52 }, { mac: "F0:18:98:5A:31:C2", signal: -47 }] },
+    ],
+  },
+];
+
+export const demoClients: T.Client[] = [
+  { name: "Pixel 8 Pro (Marta)", ip: "192.168.8.112", mac: "9C:B6:D0:12:AB:77", type: "wifi5", device_type: "phone", iface: "phy1-ap0", signal: -52, rx_bytes: 4210 * MIB, tx_bytes: 380 * MIB, self: false, reserved: false, reservable: true, blocked: false, blockable: true },
+  { name: "MacBook Air (Nacho)", ip: "192.168.8.120", mac: "F0:18:98:5A:31:C2", type: "wifi5", device_type: "laptop", iface: "phy1-ap0", signal: -47, rx_bytes: 2870 * MIB, tx_bytes: 640 * MIB, self: false, reserved: false, reservable: true, blocked: false, blockable: true, lease_expiry: now() + 2 * 3600, lease_source: "gateway" },
+  { name: "TV Samsung Salón", ip: "192.168.8.131", ip_source: "arp", mac: "70:2A:D5:44:09:E1", type: "cable", device_type: "tv", rx_bytes: 9130 * MIB, tx_bytes: 410 * MIB, self: false, reserved: false, reservable: true, blocked: false, blockable: true },
+  { name: "NAS", ip: "192.168.8.10", mac: "00:11:32:9A:BC:10", type: "cable", device_type: "nas", rx_bytes: 1820 * MIB, tx_bytes: 5240 * MIB, self: false, reserved: true, reservable: true, blocked: false, blockable: true },
+  { name: "Echo Dot Cocina", ip: "192.168.8.172", mac: "B4:E6:2D:90:14:07", type: "wifi24", device_type: "speaker", iface: "phy0-ap2", signal: -61, rx_bytes: 96 * MIB, tx_bytes: 34 * MIB, self: false, reserved: false, reservable: true, blocked: false, blockable: true },
+  { name: "Galaxy Tab S9 (invitados)", ip: "192.168.9.108", mac: "FA:22:9C:71:08:55", type: "wifi24", device_type: "tablet", iface: "phy0-ap1", signal: -66, rx_bytes: 540 * MIB, tx_bytes: 88 * MIB, self: false, reserved: false, reservable: false, blocked: false, blockable: true },
+  { name: "Impresora HP", ip: "192.168.8.180", mac: "C8:2B:96:33:77:19", type: "wifi24", device_type: "printer", iface: "phy0-ap2", signal: -72, rx_bytes: 12 * MIB, tx_bytes: 4 * MIB, self: false, reserved: false, reservable: true, blocked: false, blockable: true, lease_expiry: now() + 42 * 60, lease_source: "gateway" },
+  { name: "Robot aspiradora", ip: "192.168.8.183", mac: "DC:A6:32:08:51:90", type: "wifi24", device_type: "iot", iface: "phy0-ap2", signal: -69, rx_bytes: 31 * MIB, tx_bytes: 9 * MIB, self: false, reserved: false, reservable: true, blocked: false, blockable: true },
+];
+
+export const demoQuotas: T.QuotaProbe = {
+  applicable: true,
+  quotas: {
+    "9C:B6:D0:12:AB:77": { mac: "9C:B6:D0:12:AB:77", ip: "192.168.8.112", period: "daily", limit: 10 * 1024 * MIB, action: "throttle", throttle_kbps: 512 },
+    "70:2A:D5:44:09:E1": { mac: "70:2A:D5:44:09:E1", ip: "192.168.8.131", period: "monthly", limit: 200 * 1024 * MIB, action: "notify", throttle_kbps: 0 },
+    "00:11:32:9A:BC:10": { mac: "00:11:32:9A:BC:10", ip: "192.168.8.10", period: "monthly", limit: 300 * 1024 * MIB, action: "throttle", throttle_kbps: 2048 },
+  },
+  usage: {
+    "9C:B6:D0:12:AB:77": { used: Math.round(8.5 * 1024 * MIB), limit: 10 * 1024 * MIB, remaining: Math.round(1.5 * 1024 * MIB), period: "daily", throttled: false, exceeded: false },
+    "70:2A:D5:44:09:E1": { used: Math.round(205 * 1024 * MIB), limit: 200 * 1024 * MIB, remaining: 0, period: "monthly", throttled: false, exceeded: true },
+    "00:11:32:9A:BC:10": { used: Math.round(310 * 1024 * MIB), limit: 300 * 1024 * MIB, remaining: 0, period: "monthly", throttled: true, exceeded: true },
+  },
+  ts: 0,
+};
+
+export const demoLeases: T.Lease[] = demoClients.filter((c) => c.ip).map((c) => ({
+  expires: "11h 32m", mac: c.mac, ip: c.ip!, hostname: c.name.split(" (")[0],
+}));
+
+export const demoIpv6: T.IPv6Probe = {
+  state: "enabled",
+  lan_ipv6: "fd5f:3c4a:9e00::1/60",
+  odhcpd_enabled: true,
+  ra_mode: "server",
+  dhcpv6_mode: "server",
+};
+
+export const demoUpdate: T.UpdateCheck = {
+  available: true,
+  same_version: false,
+  owut_present: true,
+  version_from: "25.12.5",
+  version_to: "25.12.6",
+  out_of_date_packages: 3,
+  warnings: [],
+  safe_to_proceed: true,
+  missing_packages: [],
+  safe_with_reinstall: true,
+};
+
+export const demoWg: T.WGProbe = {
+  installed: true,
+  active: true,
+  running: true,
+  port: "51820",
+  address: "10.9.0.1/24",
+  public_key: "gR8sTxV3uK2mN7pQ4wY6zA1bC5dE9fH0jL3nM8oP2qU=",
+  peers: [
+    { section: "peer_nacho", name: "movil-nacho", public_key: "hK9tYwR4vL3nO8qS5xZ7aB2cD6eF0gI1kM4oN9pR3vA=", allowed_ips: ["10.9.0.2/32"], admin: true },
+    { section: "peer_marta", name: "portatil-marta", public_key: "pL2mN5bV8cX1zA4sD7fG0hJ3kL6nM9qW2eR5tY8uI1o=", allowed_ips: ["10.9.0.3/32"], admin: false },
+  ],
+  gl_tunnels: [],
+};
+
+export const demoDdns: T.DDNSProbe = {
+  installed: true,
+  wan_ip: "82.158.44.21",
+  entries: [
+    {
+      section: "casa_duckdns_org",
+      enabled: true,
+      running: true,
+      service_name: "duckdns.org",
+      domain: "casa.duckdns.org",
+      lookup_host: "casa.duckdns.org",
+      username: "casa",
+      registered_ip: "82.158.44.87",
+      last_update: new Date(Date.now() - 42 * 60000).toISOString(),
+    },
+  ],
+};
+
+export const demoMdns: T.MDNSProbe = {
+  installed: true,
+  enabled: true,
+  running: true,
+  domain: "casa.local",
+};
+
+export const demoSqm: T.SQMProbe = {
+  installed: true,
+  has_wan: true,
+  active: true,
+  running: true,
+  interface: "wan",
+  download: "280000",
+  upload: "280000",
+  profile: "balanced",
+  qdisc: "cake",
+  script: "piece_of_cake.qos",
+};
+
+export const demoOvpn: T.OVPNProbe = {
+  installed: true,
+  has_pki: true,
+  active: false,
+  running: false,
+  port: "1194",
+  subnet: "10.8.0.0/24",
+  clients: [{ name: "portatil-nacho" }],
+  public_host: "",
+  wan_ip: "203.0.113.45",
+  ddns_domains: ["casa.duckdns.org", "hub.cloudless.club"],
+};
+
+export const demoPackages: T.PkgUpgrade[] = [
+  { name: "luci-app-firewall", current: "25.118.1", available: "25.201.4" },
+  { name: "wpad-basic-mbedtls", current: "2025.08.26~1", available: "2025.09.12~1" },
+  { name: "kmod-usb-storage", current: "6.6.89-1", available: "6.6.93-1" },
+];
+
+export const demoOptionalPackages: T.OptionalPackage[] = [
+  { id: "wireguard", packages: ["wireguard-tools", "kmod-wireguard"], i18n_key: "wizard.packages.wireguard", module: "wireguard", installed: true },
+  { id: "nlbwmon", packages: ["nlbwmon"], i18n_key: "wizard.packages.nlbwmon", module: "nlbwmon", installed: false },
+  { id: "tailscale", packages: ["tailscale"], i18n_key: "wizard.packages.tailscale", module: "tailscale", installed: false },
+  { id: "adguard", packages: ["adguardhome"], i18n_key: "wizard.packages.adguard", module: "adguard", installed: false },
+];
+
+export const demoIot: T.IoTProbe = {
+  active: true,
+  ssid: "CasaGarcia-IoT",
+  band: "2g",
+  isolated: true,
+  ifaces: ["phy0-ap2"],
+  clients: 3,
+};
+
+export const demoFwd: T.FwdProbe = {
+  has_wan: true,
+  firewall: true,
+  rules: [
+    { section: "fwd_https_nas", name: "HTTPS al NAS", src_dport: "443", dest_ip: "192.168.8.10", dest_port: "443", proto: "tcp" },
+  ],
+};
+
+export const demoMultiWan: T.MultiWanProbe = {
+  applicable: true,
+  multi_wan_possible: true,
+  installed: false,
+  enabled: false,
+  running: false,
+  mode: "off",
+  managed: false,
+  foreign: false,
+  foreign_sections: [],
+  sticky: true,
+  default_track: ["1.1.1.1", "9.9.9.9"],
+  package_id: "mwan3",
+  config_present: false,
+  candidates: [
+    {
+      name: "fibra", proto: "pppoe", device: "lan4", l3_device: "pppoe-fibra", port: "lan4",
+      up: true, active: true, primary: false, share_pct: 0,
+      ipv4: ["203.0.113.24"], gateway: "203.0.113.1", metric: 10, uptime: 412300,
+      weight: 1, balance: false, metered: false, managed: false,
+      track: ["1.1.1.1", "9.9.9.9"], reason: "zone",
+    },
+    {
+      name: "movil", proto: "qmi", l3_device: "wwan0",
+      up: true, active: false, primary: false, share_pct: 0,
+      ipv4: ["192.0.2.77"], gateway: "192.0.2.78", metric: 20, uptime: 5400,
+      weight: 1, balance: false, metered: true, managed: false,
+      track: ["1.1.1.1", "9.9.9.9"], reason: "zone",
+    },
+  ],
+};
+
+export const demoTailscale: T.TSProbe = {
+  installed: true,
+  running: false,
+  state: "stopped",
+  ips: [],
+};
+
+export const demoGuest: T.GuestProbe = {
+  gateway: true,
+  active: true,
+  ssid: "CasaGarcia-Invitados",
+  subnet: "192.168.10.1",
+  isolate: true,
+  ifaces: ["phy0-ap1"],
+  clients: 1,
+  gl_conflict: false,
+};
+
+export const demoCaptivePortal: T.CaptivePortalProbe = {
+  applicable: true,
+  installed: true,
+  active: false,
+  running: false,
+  interface: "br-guest",
+  title: "",
+  message: "",
+  has_access_code: false,
+  session_minutes: 0,
+  custom_html: false,
+  has_image: false,
+};
+
+export const demoEthPorts: T.EthPort[] = [
+  { name: "wan", wan: true, up: true, speed_mbps: 1000, devices: [] },
+  { name: "lan1", wan: false, up: true, speed_mbps: 1000, devices: [{ mac: "00:11:32:9A:BC:10", name: "NAS" }] },
+  { name: "lan2", wan: false, up: true, speed_mbps: 1000, devices: [{ mac: "70:2A:D5:44:09:E1", name: "TV Samsung Salón" }] },
+  { name: "lan3", wan: false, up: false, speed_mbps: 0, devices: [] },
+  { name: "lan4", wan: false, up: true, speed_mbps: 100, devices: [{ mac: "C8:2B:96:33:77:19", name: "Impresora HP" }] },
+];
+
+export const demoMode: T.ModeProbe = {
+  mode: "router",
+  hardware_class: "router",
+  wan_in_bridge: false,
+  wan_configured: true,
+  dnsmasq_on: true,
+  firewall_on: true,
+  has_wifi: true,
+  port_count: 5,
+};
+
+export const demoAccess: T.AccessProbe = {
+  panel: { http_port: 8090, https_enabled: true, force_https: false, session_ttl: "60m" },
+  luci: { http_port: 80, https_port: 443, force_https: false, enabled: true },
+  ssh: { enabled: true, port: "22" },
+};
+
+export const demoRemoteAccess: T.RemoteAccess = {
+  applicable: true,
+  ping_wan: false,
+  remote_https: false,
+  remote_ssh: false,
+};
+
+export const demoOffload: T.OffloadProbe = {
+  applicable: true,
+  software: true,
+  hardware: false,
+  hardware_known: true,
+  hardware_active: false,
+};
+
+export const demoWifi: T.WifiUI[] = [
+  { section: "wifinet0", radio: "radio0", ifname: "phy0-ap0", band: "2g", ssid: "CasaGarcia", encryption: "sae-mixed", has_key: true, hidden: false, mac: "", bssid: "8C:53:C3:11:22:30", disabled: false, clients: [{ mac: "3A:7B:1C:44:20:11", signal: -58 }] },
+  { section: "wifinet1", radio: "radio1", ifname: "phy1-ap0", band: "5g", ssid: "CasaGarcia", encryption: "sae-mixed", has_key: true, hidden: false, mac: "", bssid: "8C:53:C3:11:22:40", disabled: false, clients: [{ mac: "9C:B6:D0:12:AB:77", signal: -52 }, { mac: "F0:18:98:5A:31:C2", signal: -47 }] },
+  { section: "wifinet2", radio: "radio0", ifname: "phy0-ap1", band: "2g", ssid: "CasaGarcia-Invitados", encryption: "sae-mixed", has_key: true, hidden: false, mac: "", bssid: "8C:53:C3:11:22:31", disabled: false, clients: [{ mac: "FA:22:9C:71:08:55", signal: -66 }] },
+  { section: "wifinet3", radio: "radio0", ifname: "phy0-ap2", band: "2g", ssid: "CasaGarcia-IoT", encryption: "psk2", has_key: true, hidden: false, mac: "", bssid: "8C:53:C3:11:22:32", disabled: false, clients: [{ mac: "B4:E6:2D:90:14:07", signal: -61 }, { mac: "C8:2B:96:33:77:19", signal: -72 }, { mac: "DC:A6:32:08:51:90", signal: -69 }] },
+];
+
+export const demoWifiSchedules: T.WifiScheduleState[] = [
+  {
+    section: "wifinet0", ifname: "phy0-ap0", ssid: "CasaGarcia", disabled: false, off_by_schedule: false,
+    schedule: { section: "wifinet0", enabled: false, days: [1, 2, 3, 4, 5], start: "23:30", end: "06:30", paused: false },
+  },
+  {
+    section: "wifinet2", ifname: "phy0-ap1", ssid: "CasaGarcia-Invitados", disabled: false, off_by_schedule: false,
+    schedule: { section: "wifinet2", enabled: true, days: [1, 2, 3, 4, 5], start: "00:00", end: "06:30", paused: false },
+  },
+  {
+    section: "wifinet3", ifname: "phy0-ap2", ssid: "CasaGarcia-IoT", disabled: false, off_by_schedule: false,
+  },
+];
+
+export const demoWifiChan: T.WifiChanRadio[] = [
+  {
+    radio: "radio0", band: "2g", ifname: "phy0-ap0", channel: 6, width: 40, htmode: "HE40",
+    utilization: 64, noise: -88, scan_complete: true,
+    neighbors: [
+      { bssid: "32:4E:8E:AC:C6:16", ssid: "Vecinos", freq: 2412, channel: 1, signal: -56, width: 20 },
+      { bssid: "AA:BB:CC:DD:EE:FF", ssid: "Orange-2G", freq: 2437, channel: 6, signal: -70, width: 20 },
+      { bssid: "11:22:33:44:55:66", ssid: "Movistar-Plus", freq: 2437, channel: 6, signal: -80, width: 20 },
+    ],
+    suggestion: { channel: 11, width: 40, htmode: "HE40", reason: "less_congested", confidence: "high" },
+  },
+  {
+    radio: "radio1", band: "5g", ifname: "phy1-ap0", channel: 44, width: 80, htmode: "HE80",
+    utilization: 12, noise: -92, scan_complete: true,
+    neighbors: [
+      { bssid: "77:88:99:AA:BB:CC", ssid: "Vecinos-5G", freq: 5180, channel: 36, signal: -75, width: 80 },
+    ],
+    suggestion: { channel: 44, width: 80, htmode: "HE80", reason: "current_ok", confidence: "high" },
+  },
+];
+
+export const demoLan: T.LANConfig = {
+  applicable: true,
+  ipaddr: "192.168.8.1",
+  netmask: "255.255.255.0",
+  ap_isolation: false,
+  dhcp: { enabled: true, start: 100, limit: 150, lease_time: 43200, gateway: "192.168.8.1", dns1: "1.1.1.1", dns2: "9.9.9.9" },
+  reservations: [{ mac: "00:11:32:9A:BC:10", ip: "192.168.8.10", name: "NAS" }],
+};
+
+export const demoDns: T.DNSConfig = {
+  applicable: true,
+  rebind_protection: true,
+  override_dns: false,
+  dns_vpn: false,
+  force_dns: false,
+  adguard_active: true,
+  adguard_installed: true,
+  adguard_running: true,
+  adguard_protection: true,
+  adguard_has_backup: true,
+  adguard_dns_port: 5353,
+  adguard_credentials: "managed",
+  doh_enabled: false,
+  doh_upstreams: [],
+  doh_providers: [
+    { id: "cloudflare", url: "https://dns.cloudflare.com/dns-query" },
+    { id: "quad9", url: "https://dns.quad9.net/dns-query" },
+    { id: "google", url: "https://dns.google/dns-query" },
+    { id: "adguard", url: "https://dns.adguard-dns.com/dns-query" },
+  ],
+  hosts: [{ ip: "192.168.8.10", hostname: "nas" }],
+};
+
+export const demoUsteer: T.UsteerAP[] = [
+  { bssid: "8C:53:C3:11:22:30", ssid: "CasaGarcia", hostname: "casa", iface: "hostapd.phy0-ap0", channel: 6, freq: 2437, util: 18, num_sta: 4, local: true, clients: [{ mac: "3A:7B:1C:44:20:11", signal: -58 }] },
+  { bssid: "8C:53:C3:11:22:40", ssid: "CasaGarcia", hostname: "casa", iface: "hostapd.phy1-ap0", channel: 44, freq: 5220, util: 26, num_sta: 2, local: true, clients: [{ mac: "9C:B6:D0:12:AB:77", signal: -52 }, { mac: "F0:18:98:5A:31:C2", signal: -47 }] },
+  { bssid: "A4:91:B1:66:40:10", ssid: "CasaGarcia", hostname: "ap-atico", iface: "hostapd.phy0-ap0", channel: 11, freq: 2462, util: 34, num_sta: 2, local: false, clients: [{ mac: "B4:E6:2D:90:14:07", signal: -61 }, { mac: "DC:A6:32:08:51:90", signal: -69 }] },
+  { bssid: "A4:91:B1:66:40:11", ssid: "CasaGarcia", hostname: "ap-atico", iface: "hostapd.phy1-ap0", channel: 48, freq: 5240, util: 12, num_sta: 1, local: false, clients: [{ mac: "FA:22:9C:71:08:55", signal: -66 }] },
+];
+
+export const demoSnapshots: T.ConfigSnapshot[] = [
+  { id: "20260825T030012", timestamp: now() - 3 * 86400, configs: 14 },
+  { id: "20260818T030008", timestamp: now() - 10 * 86400, configs: 14 },
+];
+
+/** Drift feliz (captura principal): 0 cambios. */
+export const demoDriftClean: T.DriftProbe = {
+  has_baseline: true,
+  snapshot_id: demoSnapshots[0].id,
+  snapshot_ts: demoSnapshots[0].timestamp,
+  changes: 0,
+  configs: [],
+};
+
+/** Fixture alternativa §9.2: 2 cambios en network (estado warn). */
+export const demoDriftWarn: T.DriftProbe = {
+  has_baseline: true,
+  snapshot_id: demoSnapshots[0].id,
+  snapshot_ts: demoSnapshots[0].timestamp,
+  changes: 2,
+  configs: [
+    {
+      config: "network",
+      lines: [
+        { kind: "added", text: "option dns '8.8.8.8'" },
+        { kind: "removed", text: "option mtu '1500'" },
+      ],
+    },
+  ],
+};
+
+export const demoVlans: T.VLANProbe = {
+  applicable: true,
+  bridge: "br-lan",
+  vlans: [
+    { vid: 1, name: "lan", device: "br-lan", ports: [
+      { port: "wan", tagged: false }, { port: "lan1", tagged: false },
+      { port: "lan3", tagged: false }, { port: "lan4", tagged: false },
+    ], default: true },
+    { vid: 10, name: "iot", device: "br-lan", ports: [
+      { port: "lan2", tagged: false }, { port: "lan4", tagged: true },
+    ], default: false },
+    { vid: 20, name: "guest", device: "br-lan", ports: [
+      { port: "lan2", tagged: false }, { port: "lan4", tagged: true },
+    ], default: false },
+    { vid: 30, name: "servers", device: "br-lan", ports: [
+      { port: "lan3", tagged: true }, { port: "lan4", tagged: true },
+    ], default: false },
+  ],
+  ports: ["wan", "lan1", "lan2", "lan3", "lan4"],
+};
+
+export const demoLag: T.LAGProbe = {
+  applicable: true,
+  installed: true,
+  lags: [
+    { name: "lag0", device: "bond-lag0", mode: "802.3ad", slaves: ["lan3", "lan4"], up: true },
+  ],
+  free_ports: ["wan", "lan1", "lan2"],
+};
+
+/** A four-core router with the NIC interrupt pinned to one core: the shape
+ *  the card exists to make visible. */
+export const demoCpu = {
+  cores: [
+    { idx: 0, usage_pct: 12.4, freq_mhz: 716, dropped: 0, dropped_rate: 0, squeezed: 201, squeezed_rate: 0 },
+    { idx: 1, usage_pct: 88.1, freq_mhz: 716, dropped: 41255, dropped_rate: 37.5, squeezed: 92140, squeezed_rate: 12.2 },
+    { idx: 2, usage_pct: 9.7, freq_mhz: 716, dropped: 0, dropped_rate: 0, squeezed: 28, squeezed_rate: 0 },
+    { idx: 3, usage_pct: 14.2, freq_mhz: 716, dropped: 130, dropped_rate: 0, squeezed: 4170, squeezed_rate: 0 },
+  ],
+  usage_pct: 31.1,
+  busiest_pct: 88.1,
+  load: [1.42, 1.18, 0.95],
+  temp_c: 53,
+  temp_source: "ath10k_hwmon",
+  procs: [
+    { pid: 1201, name: "netgrip", usage_pct: 11.2, rss_bytes: 18747392 },
+    { pid: 980, name: "hostapd", usage_pct: 3.4, rss_bytes: 5210112 },
+    { pid: 1444, name: "dnsmasq", usage_pct: 1.1, rss_bytes: 1785856 },
+    { pid: 1716, name: "wpa_supplicant", usage_pct: 0.8, rss_bytes: 4882432 },
+  ],
+  mem_procs: [
+    { pid: 1201, name: "netgrip", rss_bytes: 18747392 },
+    { pid: 1716, name: "wpa_supplicant", rss_bytes: 4882432 },
+    { pid: 980, name: "hostapd", rss_bytes: 5210112 },
+    { pid: 1444, name: "dnsmasq", rss_bytes: 1785856 },
+  ],
+  warming: false,
+};
+
+/** Top consumers for the demo: devices by MAC and protocols, the shape
+ *  nlbwmon reports on a real router. */
+export const demoNlbwmonTop = {
+  devices: [
+    { key: "aa:bb:cc:00:11:01", ip: "192.168.1.31", conns: 4210, down_bytes: 48_300_000_000, up_bytes: 3_100_000_000 },
+    { key: "aa:bb:cc:00:11:02", ip: "192.168.1.42", conns: 1880, down_bytes: 21_700_000_000, up_bytes: 1_450_000_000 },
+    { key: "aa:bb:cc:00:11:03", ip: "192.168.1.55", conns: 940, down_bytes: 8_900_000_000, up_bytes: 640_000_000 },
+    { key: "aa:bb:cc:00:11:04", ip: "192.168.1.60", conns: 510, down_bytes: 3_200_000_000, up_bytes: 290_000_000 },
+    { key: "aa:bb:cc:00:11:05", ip: "192.168.1.77", conns: 260, down_bytes: 900_000_000, up_bytes: 120_000_000 },
+  ],
+  apps: [
+    { key: "HTTPS", conns: 9100, down_bytes: 52_000_000_000, up_bytes: 4_100_000_000 },
+    { key: "QUIC", conns: 2400, down_bytes: 18_400_000_000, up_bytes: 1_200_000_000 },
+    { key: "HTTP", conns: 1500, down_bytes: 6_800_000_000, up_bytes: 410_000_000 },
+    { key: "DNS", conns: 8600, down_bytes: 14_000_000, up_bytes: 12_000_000 },
+    { key: "other", conns: 3200, down_bytes: 2_300_000_000, up_bytes: 800_000_000 },
+  ],
+};
+
+export const demoNlbwmon: T.NlbwmonProbe = {
+  installed: true,
+  running: true,
+  generations: 30,
+  commit_interval: 600,
+  prealloc_days: 2,
+  protocol_database: true,
+};
+
+export const demoFirewall: T.FirewallProbe = {
+  applicable: true,
+  mgmt_cidr: "192.168.1.0/24",
+  zones: [
+    { name: "lan", input: "ACCEPT", output: "ACCEPT", forward: "ACCEPT", network: ["lan"], masq: false },
+    { name: "wan", input: "REJECT", output: "ACCEPT", forward: "REJECT", network: ["wan"], masq: true },
+    { name: "guest", input: "REJECT", output: "ACCEPT", forward: "REJECT", network: ["guest"], masq: false },
+  ],
+  rules: [
+    { name: "Bloquear la tele por la noche", section: "netgrip_fw_1", proto: "tcp", src_ip: "192.168.1.50", dest_port: "80-443", target: "REJECT", start_time: "22:00", stop_time: "07:00", weekdays: "Mon Tue Wed Thu Fri Sun", enabled: true, managed: true },
+    { name: "Impresora sin salida a Internet", section: "netgrip_fw_2", proto: "", src_ip: "192.168.1.60", target: "DROP", enabled: true, managed: true },
+    { name: "Allow-DHCP-Renew", section: "allow-dhcp", proto: "udp", dest_port: "68", target: "ACCEPT", enabled: true, managed: false },
+  ],
+};
+
+// Mismos datos que internal/modules/templates.go (ListTemplates), para que el
+// demo refleje fielmente lo que devuelve el backend real — incluido el flujo de
+// confirmación de la plantilla destructiva.
+export const demoTemplates: T.Template[] = [
+  { id: "hardened", name: "Hardened router", description: "Disable IPv6, enable rebind protection, block WAN ping, disable remote SSH", destructive: false },
+  { id: "iot-ready", name: "IoT ready", description: "Enable IoT WiFi (2.4 GHz isolated), block IoT from LAN", destructive: false },
+  { id: "reset-defaults", name: "Reset to defaults", description: "Remove all custom firewall rules, reset WiFi to defaults, clear DHCP reservations", destructive: true },
+];
+
+export const demoSwitch: T.SwitchProbe = { applicable: false, ports: [] };
+export const demoSwitchModes: T.SwitchMode[] = [];
+
+export const demoPortStats: T.PortStatsProbe = {
+  ts: Date.now(),
+  ports: demoEthPorts.map((p) => ({
+    name: p.name,
+    rx_bytes: p.up ? 42 * 1024 * MIB : 0,
+    tx_bytes: p.up ? 7 * 1024 * MIB : 0,
+    rx_errors: 0, tx_errors: 0, rx_drops: 0, tx_drops: 0,
+  })),
+};
+
+export const demoPoe: T.PoEProbe = { applicable: false, total_budget_w: 0, used_w: 0, ports: [] };
+export const demoPoeWatchdogs: T.PoEWatchdogState[] = [];
+export const demoPortTemplates: T.PortTemplate[] = [];
+export const demoRoleProfiles: T.RoleProfile[] = [];
+
+export const demoDpi: T.DPIProbe = {
+  applicable: true,
+  total_bytes: 1520 * MIB,
+  total_flows: 842,
+  protocols: [
+    { name: "YouTube", bytes: 720 * MIB, flows: 96, category: "streaming" },
+    { name: "Netflix", bytes: 410 * MIB, flows: 54, category: "streaming" },
+    { name: "HTTP", bytes: 180 * MIB, flows: 402, category: "web" },
+    { name: "WhatsApp", bytes: 42 * MIB, flows: 118, category: "chat" },
+    { name: "Zoom", bytes: 96 * MIB, flows: 12, category: "voip" },
+    { name: "DNS", bytes: 8 * MIB, flows: 48, category: "dns" },
+    { name: "MQTT", bytes: 4 * MIB, flows: 64, category: "iot" },
+  ],
+};
+
+export const demoNetifyd: T.NetifydProbe = {
+  installed: true,
+  enabled: true,
+  running: true,
+  applicable: true,
+  low_end: false,
+  apps: [
+    { name: "YouTube", bytes: 720 * MIB, local_bytes: 120 * MIB, other_bytes: 600 * MIB, packets: 9600, flows: 96 },
+    { name: "Netflix", bytes: 410 * MIB, local_bytes: 80 * MIB, other_bytes: 330 * MIB, packets: 5400, flows: 54 },
+    { name: "HTTPS", bytes: 180 * MIB, local_bytes: 60 * MIB, other_bytes: 120 * MIB, packets: 4020, flows: 402 },
+    { name: "WhatsApp", bytes: 42 * MIB, local_bytes: 12 * MIB, other_bytes: 30 * MIB, packets: 1180, flows: 118 },
+    { name: "Zoom", bytes: 96 * MIB, local_bytes: 32 * MIB, other_bytes: 64 * MIB, packets: 120, flows: 12 },
+    { name: "DNS", bytes: 8 * MIB, local_bytes: 4 * MIB, other_bytes: 4 * MIB, packets: 480, flows: 48 },
+    { name: "MQTT", bytes: 4 * MIB, local_bytes: 1 * MIB, other_bytes: 3 * MIB, packets: 640, flows: 64 },
+  ],
+};
+
+function makeDemoTimeline(): T.NetifydTimeline {
+  const apps = ["YouTube", "Netflix", "HTTPS", "WhatsApp", "Zoom", "DNS", "MQTT", "QUIC", "BitTorrent", "ICMPv6"];
+  const buckets: T.NetifydTimelineBucket[] = [];
+  const now = new Date();
+  now.setMinutes(Math.floor(now.getMinutes() / 5) * 5, 0, 0);
+  const totalTotals = { local: 0, other: 0, total: 0 };
+  const appTotals: Record<string, T.NetifydBucket> = {};
+  for (let i = 23; i >= 0; i--) {
+    const t = new Date(now.getTime() - i * 5 * 60 * 1000);
+    const bucketApps: Record<string, T.NetifydBucket> = {};
+    for (const name of apps) {
+      const base = (apps.indexOf(name) + 1) * 0.5 * MIB;
+      const local = Math.round(base * (0.8 + Math.random() * 0.4));
+      const other = Math.round(base * (0.6 + Math.random() * 0.6));
+      const total = local + other;
+      bucketApps[name] = { local, other, total };
+      const agg = appTotals[name] ?? { local: 0, other: 0, total: 0 };
+      agg.local += local;
+      agg.other += other;
+      agg.total += total;
+      appTotals[name] = agg;
+      totalTotals.local += local;
+      totalTotals.other += other;
+      totalTotals.total += total;
+    }
+    buckets.push({ time: t.toISOString(), apps: bucketApps });
+  }
+  const top = Object.entries(appTotals)
+    .map(([name, b]) => ({ name, bytes: b.total, local_bytes: b.local, other_bytes: b.other, packets: 0, flows: 0 }))
+    .sort((a, b) => b.bytes - a.bytes)
+    .slice(0, 10);
+  return { buckets, top, totals: totalTotals };
+}
+
+export const demoNetifydTimeline = makeDemoTimeline();
+
+export const demoFleet: T.FleetNodeStatus[] = [
+  { id: "ap-atico", name: "ap-atico", address: "192.168.8.2", reachable: true, current_version: "0.1.2", latest_version: "0.1.2", update_available: false },
+  { id: "switch-garaje", name: "switch-garaje", address: "192.168.8.3", reachable: true, current_version: "0.1.1", latest_version: "0.1.2", update_available: true },
+];
+
+export const demoDiscoveredFleet: T.DiscoveredFleetPeer[] = [
+  { id: "ap-jardin", name: "ap-jardin", version: "0.1.2", address: "192.168.8.4", port: 8090, seen_at: new Date().toISOString() },
+];
+
+export const demoLanServices: T.LanServicesProbe = {
+  services: [
+    { id: "jellyfin", name: "Jellyfin", kind: "jellyfin", host: "nas", port: 8096, scheme: "http", alias: "jellyfin", enabled: true, ok: true, latency_ms: 12, http_status: 200, resolved_ip: "192.168.8.10" },
+    { id: "homeassistant", name: "Home Assistant", kind: "homeassistant", host: "nas", port: 8123, scheme: "http", enabled: true, ok: true, latency_ms: 9, http_status: 200, resolved_ip: "192.168.8.10" },
+    { id: "proxmox", name: "Proxmox", kind: "proxmox", host: "server", port: 8006, scheme: "https", enabled: true, ok: false, error: "dial tcp 192.168.8.30:8006: connect: connection refused" },
+  ],
+  catalog: [
+    { kind: "homeassistant", port: 8123, scheme: "http", path: "" },
+    { kind: "pihole", port: 80, scheme: "http", path: "/admin" },
+    { kind: "adguardhome", port: 3000, scheme: "http", path: "" },
+    { kind: "proxmox", port: 8006, scheme: "https", path: "" },
+    { kind: "immich", port: 2283, scheme: "http", path: "" },
+    { kind: "jellyfin", port: 8096, scheme: "http", path: "" },
+    { kind: "plex", port: 32400, scheme: "http", path: "/web" },
+    { kind: "truenas", port: 80, scheme: "http", path: "" },
+    { kind: "synology", port: 5000, scheme: "http", path: "" },
+    { kind: "openmediavault", port: 80, scheme: "http", path: "" },
+    { kind: "portainer", port: 9443, scheme: "https", path: "" },
+    { kind: "grafana", port: 3000, scheme: "http", path: "" },
+  ],
+  hosts: [
+    { name: "nas", ip: "192.168.8.10" },
+    { name: "tv", ip: "192.168.8.11" },
+    { name: "printer", ip: "192.168.8.20" },
+  ],
+  ts: 0,
+};
+
+export const demoLanDiscovery: T.LanDiscoveryResult = {
+  suggestions: [
+    { host: "nas", ip: "192.168.8.10", kind: "immich", port: 2283, scheme: "http", path: "" },
+    { host: "tv", ip: "192.168.8.11", kind: "plex", port: 32400, scheme: "http", path: "/web" },
+  ],
+  scanned_hosts: 3,
+  ts: 0,
+};
+
+export const demoCableTest: T.CableTestProbe = {
+  applicable: true,
+  ports: [
+    { port: "wan", supported: true, pair_status: "ok", length: "3m" },
+    { port: "lan1", supported: true, pair_status: "ok", length: "8m" },
+    { port: "lan2", supported: true, pair_status: "ok", length: "5m" },
+    { port: "lan3", supported: true, pair_status: "open" },
+    { port: "lan4", supported: true, pair_status: "ok", length: "12m" },
+  ],
+};
+
+export const demoStorm: T.StormProbe = { applicable: false, ports: [] };
+
+export const demoMirror: T.MirrorProbe = { applicable: false, ports: [], monitor: "", sources: [] };
+
+export const demoRate: T.RateProbe = { applicable: false, ports: [] };
+
+// #449: el escenario García es un router sin puente gestionable de switch,
+// así que las capacidades de boca aparecen como no aplicables.
+export const demoPortIsolation: T.PortIsolationProbe = { applicable: false, ports: [] };
+
+export const demoPortSecurity: T.PortSecurityProbe = {
+  applicable: false,
+  ports: [],
+  mac_limit_supported: false,
+};
+
+export const demoStp: T.STPProbe = {
+  applicable: false,
+  bridge: "br-lan",
+  bridge_info: {
+    enabled: false, priority: 32767, hello_time: 1, max_age: 10, forward_delay: 8,
+    bridge_id: "", designated_root: "", root_port: "", root_path_cost: 0, topology_change: false,
+  },
+  ports: [],
+};
+
+// Puertos físicos (#522): el demo lleva lan2 negociando a 100 Mbps en un
+// puerto de 1 G (el clásico cable de 4 hilos): enseña el banner de Puertos
+// y la razón concreta en la salud del Resumen.
+const demoLinkModes = [10, 100, 1000].map((s) => ({ speed_mbps: s, duplex: "full" }));
+const demoPhysPort = (name: string, speed: number): T.PhysPort => ({
+  name, autoneg: true, speed_mbps: speed, duplex: "full",
+  supported: demoLinkModes,
+  eee_supported: true, eee_enabled: false, eee_writable: true,
+  mtu: 1500, mtu_max: 1500, mtu_supported: false,
+});
+export const demoPhysPorts: T.PhysPortsProbe = {
+  applicable: true,
+  ports: [
+    demoPhysPort("wan", 1000),
+    demoPhysPort("lan1", 1000),
+    demoPhysPort("lan2", 100), // cable de 4 hilos: banner + razón de salud
+    demoPhysPort("lan3", 1000),
+    demoPhysPort("lan4", 0),   // sin enlace
+  ],
+};
+
+export const demoStorage: T.StorageProbe = {
+  applicable: true,
+  devices: [{
+    name: "sda1", path: "/dev/sda1", fs_type: "ext4",
+    size_bytes: 120 * 1024 * MIB,
+    used_bytes: Math.round(120 * 0.41 * 1024) * MIB,
+    free_bytes: Math.round(120 * 0.59 * 1024) * MIB,
+    mount_point: "/mnt/backups",
+  }],
+  services: [
+    { name: "samba", running: true, enabled: true },
+    { name: "nfs", running: false, enabled: false },
+  ],
+};
+
+export const demoL2Clients: T.L2Probe = {
+  applicable: true,
+  bridge: "br-lan",
+  ports: ["lan1", "lan2", "lan3", "lan4"],
+  clients: [
+    { mac: "04:cf:8c:11:22:33", vendor: "Xiaomi", port: "lan1", vlans: [10, 20], age: 42 },
+    { mac: "4c:eb:d6:aa:bb:cc", vendor: "Espressif", port: "lan1", vlans: [20], age: 3 },
+    { mac: "02:1a:2b:3c:4d:5e", random: true, port: "lan2", vlans: [0], age: 120 },
+    { mac: "00:0a:eb:12:34:56", vendor: "TP-Link Technologies", port: "lan2", vlans: [], age: 5 },
+    { mac: "00:15:6d:de:ad:00", vendor: "Ubiquiti", port: "lan3", vlans: [10], age: 90 },
+    { mac: "00:04:3c:70:80:90", vendor: "Sonos", port: "lan4", vlans: [10, 30], age: 3600, static: true },
+    { mac: "b8:27:eb:aa:11:22", vendor: "Raspberry Pi Foundation", port: "lan4", vlans: [30], age: 15 },
+  ],
+};
+
+export const demoMacAcl: T.MACACLProbe = { applicable: false, ports: [] };
+
+export const demoSelfUpdate: T.SelfUpdateCheck = {
+  current: "0.1.2",
+  latest: "0.1.2",
+  available: false,
+  notes: "",
+};
+
+export const demoAnnouncement: T.Announcement = {
+  id: "demo-welcome",
+  urgency: "info",
+  title: { es: "Esto es un aviso de ejemplo", en: "This is a sample announcement" },
+  body: {
+    es: "En producción la franja se alimenta de announcements.json del repo y se descarta por usuario.",
+    en: "In production the ribbon is fed from the repo announcements.json and dismisses per user.",
+  },
+  url: "https://github.com/gnacho/netgrip",
+  urlLabel: { es: "Ver el repo", en: "See the repo" },
+};
+
+export const demoWizard: T.WizardState = { completed: true, mode: "router" };
+
+export const demoWizardSetup: T.WizardSetupProbe = {
+  manager: "apk",
+  groups: [
+    { id: "core", title_key: "wizard.setup.required", packages: ["rpcd-mod-file"] },
+    { id: "netpulse", title_key: "wizard.setup.netpulse", packages: ["tailscale"] },
+    { id: "diagnostics", title_key: "wizard.setup.diagnostics", packages: ["ethtool-full", "tcpdump-mini"] },
+    { id: "extras", title_key: "wizard.setup.extras", packages: [] },
+  ],
+};
+
+export const demoIgmp: T.IGMPProbe = { applicable: true, enabled: true };
+
+export const demoLoops: T.LoopResult = { loops: [], has_hub: false };
+
+export const demoSelfTest: T.SelfTestResult = {
+  gateway: true,
+  wan: true,
+  dns: true,
+  ntp: true,
+  all_ok: true,
+  checks: [
+    { key: "gateway" as const, ok: true, detail: "198.51.100.1 replies" },
+    { key: "wan" as const, ok: true, detail: "link up" },
+    { key: "dns" as const, ok: true, detail: "openwrt.org resolved" },
+    { key: "ntp" as const, ok: true, detail: "a time daemon is running" },
+  ],
+  tools: { ping: true, traceroute: true, nslookup: true, dig: false },
+};
+
+export const demoPing: T.PingResult = {
+  host: "8.8.8.8",
+  count: 4,
+  sent: 4,
+  received: 4,
+  loss_pct: 0,
+  min_ms: 19.87,
+  avg_ms: 20.59,
+  max_ms: 21.46,
+  samples: [
+    { seq: 0, time_ms: 20.12, error: false },
+    { seq: 1, time_ms: 21.46, error: false },
+    { seq: 2, time_ms: 19.88, error: false },
+    { seq: 3, time_ms: 20.9, error: false },
+  ],
+};
+
+export const demoTraceroute: T.TracerouteResult = {
+  host: "8.8.8.8",
+  hops: [
+    { hop: 1, host: "192.168.1.1", rtts: [0.5, 0.48, 0.51], parsed: true },
+    { hop: 2, host: "10.0.0.1", rtts: [1.2, 1.1, 1.3], parsed: true },
+    { hop: 3, host: "8.8.8.8", rtts: [20.1, 20.2, 20.3], parsed: true },
+  ],
+};
+
+export const demoDnsLookup: T.DNSResult = {
+  query: "example.com",
+  resolver: "",
+  answers: [
+    { name: "example.com", type: "A", value: "93.184.216.34", ttl: 3600 },
+  ],
+  parsed: true,
+};
+
+export const demoTcp: T.TCPResult = {
+  host: "example.com",
+  port: 443,
+  open: true,
+};
+
+export const demoTelegram = { botToken: "", chatId: "", enabled: false };
+
+export const demoNtfy = { server: "", topic: "", tokenSet: false, enabled: false };
+
+/**
+ * Histórico 24 h (muestras cada 5 min, contadores acumulados): día tranquilo
+ * con pico de streaming a las 21:00.
+ */
+export function buildDemoHistory(): T.HistoryEntry[] {
+  const entries: T.HistoryEntry[] = [];
+  const n = 288; // 24h * 12 muestras/h
+  const start = now() - 24 * 3600;
+  let rx = 38 * 1024 * MIB; // contadores acumulados (~38 GB)
+  let tx = 5 * 1024 * MIB;
+  for (let i = 0; i < n; i++) {
+    const ts = start + i * 300;
+    const hour = new Date(ts * 1000).getHours();
+    // ritmo base por franja + pico de streaming 21:00–23:00
+    let rate = 0.4 * MIB; // B/s aprox de fondo
+    if (hour >= 8 && hour <= 22) rate = 1.6 * MIB;
+    if (hour >= 21 && hour <= 23) rate = 12 * MIB; // streaming
+    const jitter = 0.7 + 0.6 * Math.abs(Math.sin(i * 0.9) + Math.sin(i * 0.37));
+    rx += rate * jitter * 300;
+    tx += rate * jitter * 300 * 0.14;
+    entries.push({
+      ts,
+      rx: Math.round(rx),
+      tx: Math.round(tx),
+      load: Math.round((0.3 + 0.2 * Math.abs(Math.sin(i * 0.5))) * 100) / 100,
+      clients: 6 + Math.round(2 * Math.abs(Math.sin(i * 0.21))),
+    });
+  }
+  return entries;
+}
+
+// banIP (#351): instalado, contadores nft activos y feeds variados (una
+// dirección override, dos desactivados) para mostrar todos los estados.
+export const demoBanip: T.BanipProbe = {
+  installed: true,
+  enabled: true,
+  running: true,
+  nft_count: true,
+  applicable: true,
+  version: "1.5.6-r7",
+  mem_available_mb: 412,
+  feeds: [
+    { name: "cinsscore", enabled: true, direction: "", in_catalog: true, chain: "in", ipv6: true },
+    { name: "debl", enabled: true, direction: "", in_catalog: true, chain: "in", ipv6: true, last_download_failed: true }, // #352: descarga fallida, set vacío
+    { name: "turris", enabled: true, direction: "", in_catalog: true, chain: "in", ipv6: true },
+    { name: "doh", enabled: true, direction: "out", in_catalog: true, chain: "out", ipv6: true },
+    { name: "hagezi", enabled: false, direction: "out", in_catalog: true, chain: "out", ipv6: true },
+    { name: "country", enabled: false, direction: "inout", in_catalog: true, chain: "in", ipv6: true },
+  ],
+  catalog: [
+    { name: "firehol1", descr: "firehol level 1 compilation", chain: "in", ipv6: true, custom: false },
+    { name: "threat", descr: "emerging threats ruleset", chain: "in", ipv6: false, custom: false },
+    { name: "vpndc", descr: "VPN datacenter IPs", chain: "in", ipv6: true, custom: false },
+    { name: "mis-ips", descr: "Feed propio de IPs observadas", chain: "", ipv6: false, custom: true },
+  ],
+  report: {
+    parsed: true,
+    timestamp: "2026-09-20 10:15:03",
+    sets: [
+      { name: "allowlist.v4", elements: 2, packets_in: 0, packets_out: 0, local_allow: true, local_block: false },
+      { name: "blocklist.v4", elements: 1, packets_in: 12, packets_out: 0, local_allow: false, local_block: true },
+      { name: "cinsscore.v4", elements: 11498, packets_in: 444, packets_out: 0, local_allow: false, local_block: false },
+      { name: "cinsscore.v6", elements: 136, packets_in: 0, packets_out: 0, local_allow: false, local_block: false },
+      { name: "turris.v4", elements: 4553, packets_in: 131, packets_out: 0, local_allow: false, local_block: false },
+      { name: "doh.v4", elements: 1727, packets_in: 0, packets_out: 2233, local_allow: false, local_block: false },
+      { name: "doh.v6", elements: 1217, packets_in: 0, packets_out: 0, local_allow: false, local_block: false },
+    ],
+    total_ips: 19132,
+    packets_in: 606,
+    packets_out: 2233,
+    auto_allow: 2,
+    auto_block: 13,
+    dos: {
+      syn_packets: 42,
+      udp_packets: 7,
+      icmp_packets: 0,
+      invalid_ct_packets: 133,
+      invalid_tcp_packets: 5,
+      syn_limit: 10,
+      udp_limit: 100,
+      icmp_limit: 25,
+    },
+  },
+  allowlist: ["192.168.1.0/24", "vpn.casa.example"],
+  blocklist: ["203.0.113.66"],
+};
+
+export const demoUpnp: T.UpnpProbe = {
+  installed: true,
+  enabled: false,
+  running: false,
+  applicable: true,
+  secure_mode: true,
+  natpmp: true,
+  upnp: true,
+  lease_file: "/var/run/miniupnpd.leases",
+  leases: [
+    { proto: "TCP", ext_port: 32400, int_addr: "192.168.1.40", int_port: 32400, lease_time: 5400, desc: "Plex Media Server" },
+    { proto: "UDP", ext_port: 51820, int_addr: "192.168.1.50", int_port: 51820, lease_time: 0, desc: "WireGuard" },
+    { proto: "TCP", ext_port: 8080, int_addr: "192.168.1.60", int_port: 80, lease_time: 120, desc: "web server" },
+  ],
+  rules: [
+    { section: "@perm_rule[0]", action: "allow", int_addr: "0.0.0.0/0", int_ports: "1024-65535", ext_ports: "1024-65535", comment: "Allow high ports", managed: false },
+    { section: "netgrip_upnp_1", action: "deny", int_addr: "192.168.1.66", int_ports: "", ext_ports: "", comment: "smart TV", managed: true },
+  ],
+};

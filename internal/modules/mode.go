@@ -1,0 +1,260 @@
+package modules
+
+import (
+	"fmt"
+	"os/exec"
+	"strings"
+
+	"github.com/gnacho/netgrip/internal/executor"
+	"github.com/gnacho/netgrip/internal/ubus"
+)
+
+// ModeProbe reports whether the router is a gateway/router or an access
+// point, using the real state: a WAN interface inside the LAN bridge
+// (dnsmasq and firewall off) is an AP reconverting the WAN into a LAN
+// port. Hardware class detects switches (no WiFi, many ports).
+//
+// Role is the first-class answer to "what is this device" (#447) and drives
+// feature visibility: a working WAN uplink makes it a router; without one
+// but with Wi-Fi radios it is an access point; with only LAN switch ports
+// it is a managed switch. Mode and HardwareClass stay for compatibility.
+type ModeProbe struct {
+	Mode          string `json:"mode"`           // router | ap
+	HardwareClass string `json:"hardware_class"` // router | ap | switch
+	Role          string `json:"role"`           // router | ap | switch
+	WanInBridge   bool   `json:"wan_in_bridge"`
+	WanConfigured bool   `json:"wan_configured"`
+	DnsmasqOn     bool   `json:"dnsmasq_on"`
+	FirewallOn    bool   `json:"firewall_on"`
+	HasWifi       bool   `json:"has_wifi"`
+	PortCount     int    `json:"port_count"`
+}
+
+// computeRole derives the device role from the probe facts (#447):
+// WAN uplink -> router; no WAN but radios -> access point; only switch
+// ports -> managed switch. Pure so the rules are unit-testable.
+func computeRole(p *ModeProbe) string {
+	switch {
+	case p.WanConfigured && !p.WanInBridge:
+		return "router"
+	case p.HasWifi:
+		return "ap"
+	default:
+		return "switch"
+	}
+}
+
+// ProbeMode detects the router mode and hardware class.
+func ProbeMode() *ModeProbe {
+	p := &ModeProbe{
+		WanConfigured: hasGatewayUplink(),
+		DnsmasqOn:     executor.ServiceEnabled("dnsmasq"),
+		FirewallOn:    executor.ServiceEnabled("firewall"),
+		HasWifi:       hasWifiRadios(),
+		PortCount:     len(bridgePortList()),
+	}
+	out, err := exec.Command("ip", "-o", "link", "show", wanPortName()).Output()
+	if err == nil && strings.Contains(string(out), "master "+LANBridge()) {
+		p.WanInBridge = true
+	}
+	switch {
+	case p.WanInBridge:
+		p.Mode = "ap"
+	case p.WanConfigured:
+		p.Mode = "router"
+	default:
+		p.Mode = "ap"
+	}
+
+	switch {
+	case !p.HasWifi && p.PortCount > 4:
+		p.HardwareClass = "switch"
+	default:
+		p.HardwareClass = p.Mode
+	}
+	p.Role = computeRole(p)
+	return p
+}
+
+func hasWifiRadios() bool {
+	out, err := exec.Command("ls", "/sys/class/ieee80211/").Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) != ""
+}
+
+// hasGatewayUplink decides whether this device routes traffic for others.
+// The route-based hasUplink() alone misfires on DHCP-managed LAN devices
+// (AP, switch): they learn the default route from the real gateway, so the
+// "active WAN" resolves to their own lan section and they masquerade as
+// routers. Named wan* interface sections settle it (they survive in
+// renamed-uplink setups, like the QMI failover in #325); otherwise the
+// route-based uplink only counts when its section is not a lan* one
+// (uplinks renamed "isp" and friends still win, #325).
+func hasGatewayUplink() bool {
+	ifaceNames := []string{}
+	if show, err := uciShowNetwork(); err == nil {
+		for name, s := range parseUCIShow(show, "network") {
+			if s.Type == "interface" {
+				ifaceNames = append(ifaceNames, name)
+			}
+		}
+	}
+	active := ubus.ActiveWANInterfaceName()
+	return isGatewayByUplinkNames(ifaceNames, active, uciSectionExists("network."+active))
+}
+
+// isGatewayByUplinkNames is the pure decision behind hasGatewayUplink.
+func isGatewayByUplinkNames(ifaceNames []string, activeName string, activeSectionExists bool) bool {
+	for _, n := range ifaceNames {
+		if strings.HasPrefix(n, "wan") {
+			return true
+		}
+	}
+	if activeName == "" || strings.HasPrefix(activeName, "lan") {
+		return false
+	}
+	return activeSectionExists
+}
+
+// SetMode converts the router between Router (gateway) and AP modes. This is
+// destructive: it changes the network identity and may drop the current
+// management path, so it snapshots network/dhcp/firewall, runs a healthcheck
+// and rolls back on failure. The caller must confirm explicitly.
+func SetMode(target string) (*ModeProbe, bool, error) {
+	InvalidateKey("mode")
+	invalidateClients()
+	probe := ProbeMode()
+	if target != "router" && target != "ap" {
+		return probe, false, fmt.Errorf("target must be router or ap")
+	}
+	if probe.Mode == target {
+		return probe, false, fmt.Errorf("router is already in %s mode", target)
+	}
+
+	snapNetwork, err := executor.Snapshot("network")
+	if err != nil {
+		return probe, false, fmt.Errorf("snapshot network: %w", err)
+	}
+	snapDhcp, err := executor.Snapshot("dhcp")
+	if err != nil {
+		return probe, false, fmt.Errorf("snapshot dhcp: %w", err)
+	}
+	snapFirewall, err := executor.Snapshot("firewall")
+	if err != nil {
+		return probe, false, fmt.Errorf("snapshot firewall: %w", err)
+	}
+	rollback := func() {
+		_ = executor.Restore("network", snapNetwork)
+		_ = executor.Restore("dhcp", snapDhcp)
+		_ = executor.Restore("firewall", snapFirewall)
+		_ = executor.Run(executor.Op{Kind: "initd", Args: []string{"network", "restart"}})
+		if executor.ServiceEnabled("firewall") {
+			_ = executor.Run(executor.Op{Kind: "initd", Args: []string{"firewall", "reload"}})
+		}
+	}
+
+	ops, err := modeOps(target, probe)
+	if err != nil {
+		return probe, false, err
+	}
+	if err := executor.Apply(ops, nil); err != nil {
+		rollback()
+		return ProbeMode(), true, err
+	}
+
+	// Healthcheck: the router must remain reachable on the LAN. On Router
+	// mode the lan keeps its static IP; on AP mode it becomes a DHCP client,
+	// so we only require the bridge to have an address (from either source).
+	if !routerAlive() {
+		rollback()
+		return ProbeMode(), true, fmt.Errorf("router unreachable after mode change, rolled back")
+	}
+	after := ProbeMode()
+	if after.Mode != target {
+		rollback()
+		return ProbeMode(), true, fmt.Errorf("mode did not change as expected, rolled back")
+	}
+	return after, false, nil
+}
+
+// routerAlive checks the router is still on the network after a mode
+// change: the LAN's own L3 device must carry an IPv4. That device is the
+// bridge on simple setups but a VLAN sub-interface of it (br-lan.10) under
+// 802.1Q filtering, where the bridge itself holds no address - checking
+// the bridge there reports a healthy router as dead and triggers a
+// needless rollback.
+func routerAlive() bool {
+	resolved, err := exec.Command("sh", "-c",
+		"ip -4 -o addr show "+LANDevice()+" | grep -q 'inet '").Output()
+	return err == nil || len(resolved) > 0
+}
+
+func modeOps(target string, probe *ModeProbe) ([]executor.Op, error) {
+	var ops []executor.Op
+	set := func(key, value string) {
+		ops = append(ops, executor.Op{Kind: "uci_set", Args: []string{key, value}})
+	}
+	add := func(key, value string) {
+		ops = append(ops, executor.Op{Kind: "uci_add_list", Args: []string{key, value}})
+	}
+	del := func(key, value string) {
+		ops = append(ops, executor.Op{Kind: "uci_del_list", Args: []string{key, value}})
+	}
+
+	// The bridge is not always the first device section, nor always named
+	// br-lan, and the WAN port is not always named "wan" - all three are
+	// resolved so a renamed bridge or board-specific port name does not
+	// send these writes at the wrong section.
+	bridgeSec := BridgeDeviceSection()
+	if bridgeSec == "" {
+		bridgeSec = "@device[0]"
+	}
+	wanPort := wanPortName()
+
+	if target == "router" {
+		// Gate: restore WAN as a real interface (DHCP client), pull it out of
+		// the LAN bridge, and enable dnsmasq + firewall.
+		del("network."+bridgeSec+".ports", wanPort)
+		set("network.wan", "interface")
+		set("network.wan.device", wanPort)
+		set("network.wan.proto", "dhcp")
+		ops = append(ops,
+			executor.Op{Kind: "initd", Args: []string{"dnsmasq", "enable"}},
+			executor.Op{Kind: "initd", Args: []string{"dnsmasq", "start"}},
+			executor.Op{Kind: "initd", Args: []string{"firewall", "enable"}},
+			executor.Op{Kind: "initd", Args: []string{"firewall", "restart"}},
+		)
+	} else { // ap
+		// Drop the WAN interface and merge the WAN port back into the bridge;
+		// the lan becomes a DHCP client of the new gateway.
+		ops = append(ops, executor.Op{Kind: "uci_delete", Args: []string{"network.wan"}})
+		add("network."+bridgeSec+".ports", wanPort)
+		set("network.lan.device", LANBridge())
+		if uciGet("network.lan.proto") == "static" {
+			set("network.lan.proto", "dhcp")
+		}
+		ops = append(ops,
+			executor.Op{Kind: "initd", Args: []string{"dnsmasq", "disable"}},
+			executor.Op{Kind: "initd", Args: []string{"dnsmasq", "stop"}},
+			executor.Op{Kind: "initd", Args: []string{"dnsmasq", "restart"}},
+			executor.Op{Kind: "initd", Args: []string{"firewall", "disable"}},
+			executor.Op{Kind: "initd", Args: []string{"firewall", "stop"}},
+		)
+	}
+	ops = append(ops,
+		executor.Op{Kind: "uci_commit", Args: []string{"network"}},
+		executor.Op{Kind: "uci_commit", Args: []string{"dhcp"}},
+		executor.Op{Kind: "uci_commit", Args: []string{"firewall"}},
+		executor.Op{Kind: "initd", Args: []string{"network", "restart"}},
+	)
+	return ops, nil
+}
+
+// WanPortActive reports whether the port named "wan" is a real WAN port
+// (i.e. the router is in router mode). On AP mode the WAN port is a LAN
+// port and must not be presented as WAN.
+func WanPortActive() bool {
+	return ProbeMode().Mode == "router"
+}

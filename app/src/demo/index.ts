@@ -1,0 +1,1065 @@
+import type * as T from "../types";
+import type { api } from "../api";
+import * as D from "./data";
+
+/**
+ * Modo demo §9: objeto con la MISMA interfaz que `api`. Los GET resuelven
+ * con latencia simulada (150–400 ms); los writes devuelven ModuleResult tras
+ * 800–1500 ms. Las series de tráfico evolucionan entre llamadas.
+ */
+
+const wait = (min: number, max: number) =>
+  new Promise<void>((r) => setTimeout(r, min + Math.random() * (max - min)));
+
+const get = async <V>(v: V): Promise<V> => { await wait(150, 400); return v; };
+const write = async <V>(state: V): Promise<T.ModuleResult<V>> => {
+  await wait(800, 1500);
+  return { status: "applied", rolled_back: false, state };
+};
+
+// ── Estado mutable del escenario ──────────────────────────────────────────
+const state = {
+  clients: structuredClone(D.demoClients),
+  wireless: D.demoWireless,
+  wifi: D.demoWifi,
+  wifischedule: structuredClone(D.demoWifiSchedules),
+  wifichan: structuredClone(D.demoWifiChan),
+  wg: structuredClone(D.demoWg),
+  ddns: { ...D.demoDdns },
+  mdns: { ...D.demoMdns },
+  sqm: { ...D.demoSqm },
+  ovpn: structuredClone(D.demoOvpn),
+  ipv6: { ...D.demoIpv6 },
+  guest: { ...D.demoGuest },
+  captive: { ...D.demoCaptivePortal },
+  iot: { ...D.demoIot },
+  fwd: structuredClone(D.demoFwd),
+  mwan: structuredClone(D.demoMultiWan),
+  ts: { ...D.demoTailscale },
+  lan: structuredClone(D.demoLan),
+  dns: structuredClone(D.demoDns),
+  packages: [...D.demoPackages],
+  optionalPkgs: structuredClone(D.demoOptionalPackages),
+  drift: structuredClone(D.demoDriftClean),
+  snapshots: [...D.demoSnapshots],
+  vlans: structuredClone(D.demoVlans),
+  lag: structuredClone(D.demoLag),
+  firewall: structuredClone(D.demoFirewall),
+  nlbwmon: { ...D.demoNlbwmon },
+  banip: structuredClone(D.demoBanip),
+  upnp: structuredClone(D.demoUpnp),
+  offload: { ...D.demoOffload },
+  mode: { ...D.demoMode },
+  igmp: { ...D.demoIgmp },
+  access: structuredClone(D.demoAccess),
+  remote: { ...D.demoRemoteAccess },
+  storage: structuredClone(D.demoStorage),
+  fleet: structuredClone(D.demoFleet),
+  discoveredFleet: structuredClone(D.demoDiscoveredFleet),
+  lanServices: structuredClone(D.demoLanServices),
+  telegram: { ...D.demoTelegram },
+  ntfy: { ...D.demoNtfy },
+  netpulse: {
+    enabled: true,
+    configured: true,
+    server: "https://netpulse.example.com",
+    slug: "garcia-gw",
+  },
+  mqtt: {
+    enabled: true,
+    host: "broker.example.com",
+    port: 1883,
+    user: "netgrip",
+    node_id: "garcia-gw",
+    interval: 60,
+    tls: false,
+    tls_insecure: false,
+  },
+  nftqos: {
+    applicable: true,
+    limits: {
+      "00:11:22:33:44:55": { mac: "00:11:22:33:44:55", ip: "192.168.1.100", download: 20, upload: 5 },
+    } as Record<string, T.NftQoSLimit>,
+  },
+  parental: {
+    rules: {
+      "FA:22:9C:71:08:55": { mac: "FA:22:9C:71:08:55", enabled: true, days: [5, 6], start: "21:00", end: "07:00", paused: true },
+      "9C:B6:D0:12:AB:77": { mac: "9C:B6:D0:12:AB:77", enabled: true, days: [0, 1, 2, 3, 4, 5, 6], start: "21:00", end: "07:00", paused: false },
+    } as Record<string, T.ParentalRule>,
+  },
+  quota: structuredClone(D.demoQuotas),
+  portTemplates: [...D.demoPortTemplates],
+  hasCert: true,
+  panelHttps: false,
+  panelCert: "panel" as "panel" | "router" | "custom",
+  history: D.buildDemoHistory(),
+  netifyd: { ...D.demoNetifyd },
+};
+
+// ── Contadores de tráfico que evolucionan con ruido suave acotado ─────────
+const rates: Record<string, { rx: number; tx: number }> = {
+  "br-lan": { rx: 5.2e6, tx: 1.1e6 },
+  eth0: { rx: 5.4e6, tx: 1.15e6 },
+  wlan0: { rx: 2.1e6, tx: 0.4e6 },
+  wlan1: { rx: 2.8e6, tx: 0.6e6 },
+};
+const counters: Record<string, { rx_bytes: number; tx_bytes: number }> = Object.fromEntries(
+  Object.keys(rates).map((k) => [k, { rx_bytes: 38e9 * Math.random() + 5e9, tx_bytes: 6e9 }]),
+);
+let countersTs = Date.now();
+
+function nextNetdev() {
+  const ts = Date.now();
+  const dt = Math.max(0.5, (ts - countersTs) / 1000);
+  countersTs = ts;
+  for (const [name, base] of Object.entries(rates)) {
+    // ruido suave acotado ±35 % con deriva lenta
+    const noise = 1 + 0.35 * Math.sin(ts / 7000 + name.length) * Math.random();
+    counters[name].rx_bytes += base.rx * noise * dt;
+    counters[name].tx_bytes += base.tx * (2 - noise) * dt;
+  }
+  return {
+    ts,
+    counters: Object.entries(counters).map(([name, c]) => ({
+      name, rx_bytes: Math.round(c.rx_bytes), tx_bytes: Math.round(c.tx_bytes),
+    })),
+  };
+}
+
+let clientsTs = Date.now();
+const DEMO_BANDS = ["2g", "5g"];
+function nextClients() {
+  const ts = Date.now();
+  const dt = Math.max(0.5, (ts - clientsTs) / 1000);
+  clientsTs = ts;
+  for (const c of state.clients) {
+    const factor = c.type === "cable" ? 2.2 : c.type === "wifi5" ? 1.4 : 0.15;
+    const noise = 1 + 0.5 * Math.sin(ts / 9000 + c.mac.length) * Math.random();
+    c.rx_bytes += Math.round(6e5 * factor * noise * dt);
+    c.tx_bytes += Math.round(1.2e5 * factor * (2 - noise) * dt);
+    const rule = state.parental.rules[c.mac];
+    c.parental_blocked = !!rule?.paused;
+    c.parental_next = rule && !rule.paused ? rule.start : undefined;
+    const q = state.quota.quotas[c.mac];
+    const u = q ? state.quota.usage[c.mac] : undefined;
+    if (q && u) {
+      c.quota_used = u.used;
+      c.quota_limit = u.limit;
+      c.quota_remaining = u.remaining;
+      c.quota_period = q.period;
+      c.quota_throttled = u.throttled;
+      c.quota_exceeded = u.exceeded;
+    } else {
+      delete c.quota_used;
+      delete c.quota_limit;
+      delete c.quota_remaining;
+      delete c.quota_period;
+      delete c.quota_throttled;
+      delete c.quota_exceeded;
+    }
+  }
+  return { ts, clients: state.clients, bands: DEMO_BANDS };
+}
+
+export const demoApi: typeof api = {
+  // sesión
+  login: async () => { await wait(400, 800); },
+  logout: async () => { await wait(100, 200); },
+  me: () => get(undefined as void),
+  snmp: () => get({ installed: true, running: true, enabled: true, managed: true, location: "Rack 1", contact: "admin@example.com", listen: "UDP:161", community_ro: "monitors" }),
+  wizardState: () => get(D.demoWizard),
+  wizardSetup: () => get(D.demoWizardSetup),
+  installWizardSetup: async () => { await wait(800, 1500); return { job: { phase: "done", total: 1, done: 1, installed: ["ethtool-full"] } }; },
+  wizardComplete: async () => { await wait(400, 800); return { status: "ok" }; },
+  wizardReset: async () => { await wait(400, 800); return { ...D.demoWizard, completed: false }; },
+  setSnmp: async () => { await wait(400, 800); return { status: "applied", rolled_back: false, state: { installed: true, running: true, enabled: true, managed: true, location: "Rack 1", contact: "admin@example.com", listen: "UDP:161", community_ro: "monitors" } }; },
+
+  // núcleo
+  board: () => get(D.demoBoard),
+  system: () => get(D.demoSystem),
+  wan: () => get(D.demoWan),
+  wanConfig: async () => ({ iface: "wan", proto: "dhcp", device: "wan", mtu: "1500" }),
+  checkPublicIp: async () => {
+    await wait(600, 1200);
+    return { ip: "203.0.113.45", iface: "wan", source: "api.ipify.org", checked_at: Math.floor(Date.now() / 1000) };
+  },
+  setWanConfig: async (cfg) => { await wait(300, 600); return cfg; },
+  wireless: () => get(state.wireless),
+  leases: () => get(D.demoLeases),
+  clients: async () => { await wait(150, 400); return nextClients(); },
+  blockedClients: async () => {
+    await wait(80, 200);
+    const blocked = state.clients
+      .filter((c) => c.blocked || (c.blocked_on?.length ?? 0) > 0)
+      .map((c): import("../types").BlockedClient => ({
+        mac: c.mac,
+        type: c.type === "cable" ? "cable" : "wifi",
+        bands: c.blocked_on,
+        blocked_everywhere: !!c.blocked,
+      }));
+    return { blocked, ts: Date.now() };
+  },
+  reserveClient: async (mac, _ip, reserved) => {
+    await wait(800, 1200);
+    const c = state.clients.find((x) => x.mac === mac);
+    if (c) c.reserved = reserved;
+    return { status: "ok" };
+  },
+  blockClient: async (mac, _type, blocked, band) => {
+    await wait(800, 1200);
+    const c = state.clients.find((x) => x.mac === mac);
+    if (!c) return { status: "ok" };
+    if (band) {
+      const on = new Set(c.blocked_on ?? []);
+      if (blocked) on.add(band); else on.delete(band);
+      const list = [...on].sort();
+      c.blocked_on = list.length ? list : undefined;
+      c.blocked = DEMO_BANDS.every((b) => on.has(b));
+    } else {
+      c.blocked = blocked;
+      c.blocked_on = blocked ? [...DEMO_BANDS] : undefined;
+    }
+    return { status: "ok" };
+  },
+  clientMeta: async () => {
+    await wait(100, 250);
+    const meta: Record<string, { name: string; device_type: string }> = {};
+    for (const c of state.clients) if (c.device_type) meta[c.mac] = { name: "", device_type: c.device_type };
+    return { meta };
+  },
+  setClientMeta: async (mac, name, device_type) => {
+    await wait(500, 900);
+    const c = state.clients.find((x) => x.mac === mac);
+    if (c) { if (name) c.name = name; c.device_type = device_type; }
+    return { meta: { [mac]: { name, device_type } } };
+  },
+  wakeOnLan: async () => { await wait(400, 900); return { status: "ok" }; },
+  netdev: async () => { await wait(150, 400); return nextNetdev(); },
+  history: () => get({ entries: state.history }),
+  mode: () => get(state.mode),
+  setMode: async (target) => { state.mode.mode = target; return write({ ...state.mode }); },
+
+  // servicios
+  ipv6: () => get(state.ipv6),
+  setIpv6: async (enabled) => {
+    await wait(800, 1500);
+    state.ipv6.state = enabled ? "enabled" : "disabled";
+    return { status: "applied" as const, rolled_back: false, state: { ...state.ipv6 } };
+  },
+  wireguard: () => get(state.wg),
+  setWireguard: async (action) => {
+    state.wg.active = state.wg.running = action === "enable";
+    return write(state.wg);
+  },
+  addWgPeer: async (name, publicKey, admin) => {
+    state.wg.peers.push({ section: `peer_${state.wg.peers.length}`, name, public_key: publicKey, allowed_ips: [], admin });
+    return write(state.wg);
+  },
+  addWgPeerQr: async (name, admin) => {
+    await wait(800, 1500);
+    state.wg.peers.push({ section: `peer_${state.wg.peers.length}`, name, public_key: "DEMO" + "x".repeat(39) + "=", allowed_ips: [], admin });
+    return { config: "[Interface]\nPrivateKey = <demo>\nAddress = 10.9.0.9/32\n\n[Peer]\nPublicKey = " + state.wg.public_key + "\nAllowedIPs = 0.0.0.0/0\nEndpoint = casa.duckdns.org:51820\n", state: state.wg };
+  },
+  deleteWgPeer: async (publicKey) => {
+    state.wg.peers = state.wg.peers.filter((p) => p.public_key !== publicKey);
+    return write(state.wg);
+  },
+  ddns: () => get(state.ddns),
+  setDdns: async (cfg) => {
+    await wait(800, 1500);
+    const existing = state.ddns.entries.find((e) => e.domain === cfg.domain);
+    if (existing) {
+      existing.enabled = cfg.enabled;
+      if (cfg.service_name) existing.service_name = cfg.service_name;
+      if (cfg.domain) existing.domain = cfg.domain;
+      if (cfg.lookup_host !== undefined) existing.lookup_host = cfg.lookup_host;
+      if (cfg.username !== undefined) existing.username = cfg.username;
+      existing.running = cfg.enabled;
+    } else if (cfg.enabled && cfg.domain) {
+      state.ddns.entries.push({
+        section: cfg.domain.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_+|_+$/g, "").replace(/^[0-9]/, "d$&") || "d",
+        enabled: true,
+        running: true,
+        service_name: cfg.service_name || "duckdns.org",
+        domain: cfg.domain,
+        lookup_host: cfg.lookup_host || "",
+        username: cfg.username || "",
+        registered_ip: D.demoWan.ipv4[0] || "",
+        last_update: new Date().toISOString(),
+      });
+    }
+    return { status: "applied" as const, rolled_back: false, state: state.ddns };
+  },
+  deleteDdns: async (section) => {
+    await wait(800, 1500);
+    state.ddns.entries = state.ddns.entries.filter((e) => e.section !== section);
+    return { status: "applied" as const, rolled_back: false, state: state.ddns };
+  },
+  forceDdns: async (section) => {
+    await wait(800, 1500);
+    const e = state.ddns.entries.find((x) => x.section === section);
+    if (e) {
+      e.registered_ip = state.ddns.wan_ip ?? "";
+      e.last_update = new Date().toISOString();
+    }
+    return { status: "applied" as const, rolled_back: false, state: state.ddns };
+  },
+  mdns: () => get(state.mdns),
+  setMdns: async (enabled) => {
+    state.mdns.enabled = state.mdns.running = enabled;
+    return write(state.mdns);
+  },
+  sqm: () => get(state.sqm),
+  setSqm: async (cfg) => {
+    await wait(800, 1500);
+    // §9.1: 10 % de rollbacks simulados en SQM para fotografiar el ActionBanner
+    if (Math.random() < 0.1) {
+      return { status: "rolled_back" as const, rolled_back: true, state: state.sqm, error: "rtnetlink: file exists (cake no pudo recrearse en wan)" };
+    }
+    state.sqm.active = state.sqm.running = cfg.enabled;
+    if (cfg.download) state.sqm.download = cfg.download;
+    if (cfg.upload) state.sqm.upload = cfg.upload;
+    if (cfg.profile) state.sqm.profile = cfg.profile;
+    return { status: "applied" as const, rolled_back: false, state: state.sqm };
+  },
+  openvpn: () => get(state.ovpn),
+  setOpenvpn: async (action) => {
+    state.ovpn.active = state.ovpn.running = action === "enable";
+    return write(state.ovpn);
+  },
+  addOvpnClient: async (name) => {
+    await wait(800, 1500);
+    state.ovpn.clients.push({ name });
+    return { config: "# demo .ovpn para " + name + "\nclient\ndev tun\nproto udp\nremote casa.duckdns.org 1194\n", state: state.ovpn };
+  },
+  deleteOvpnClient: async (name) => {
+    await wait(800, 1500);
+    state.ovpn.clients = state.ovpn.clients.filter((c) => c.name !== name);
+    return { state: state.ovpn };
+  },
+  setOvpnPublicHost: async (host) => {
+    await wait(400, 900);
+    state.ovpn.public_host = host.trim();
+    return { ...state.ovpn };
+  },
+  tailscale: () => get(state.ts),
+  setTailscale: async (enabled) => {
+    state.ts.running = enabled;
+    state.ts.state = enabled ? "connected" : "stopped";
+    return write(state.ts);
+  },
+  guestwifi: () => get(state.guest),
+  setGuestwifi: async (cfg) => {
+    state.guest.active = cfg.enabled;
+    if (cfg.ssid) state.guest.ssid = cfg.ssid;
+    return write(state.guest);
+  },
+  captiveportal: () => get(state.captive),
+  setCaptiveportal: async (cfg) => {
+    state.captive.active = cfg.enabled;
+    state.captive.running = cfg.enabled;
+    if (cfg.title !== undefined) state.captive.title = cfg.title;
+    if (cfg.message !== undefined) state.captive.message = cfg.message;
+    state.captive.has_access_code = !!cfg.access_code;
+    if (cfg.session_minutes !== undefined) state.captive.session_minutes = cfg.session_minutes;
+    state.captive.custom_html = !!cfg.custom_html;
+    return write(state.captive);
+  },
+  uploadCaptivePortalImage: async () => {
+    state.captive.has_image = true;
+    return write(state.captive);
+  },
+  iotwifi: () => get(state.iot),
+  setIotwifi: async (cfg) => {
+    state.iot.active = cfg.enabled;
+    if (cfg.ssid) state.iot.ssid = cfg.ssid;
+    return write(state.iot);
+  },
+  cpu: () => get(D.demoCpu),
+  nlbwmon: () => get(state.nlbwmon),
+  nlbwmonTop: () => get(D.demoNlbwmonTop),
+  setNlbwmon: async (cfg) => write({ ...state.nlbwmon, ...cfg, running: cfg.enabled ?? state.nlbwmon.running }),
+  banip: () => get(state.banip),
+  banipAction: async (action: string) => {
+    await wait(800, 1500);
+    if (action === "start" || action === "reload" || action === "restart" || action === "enable") {
+      state.banip.enabled = true;
+      state.banip.running = true;
+    } else {
+      state.banip.running = false;
+      if (action === "disable") state.banip.enabled = false;
+    }
+    return { status: "applied" as const, rolled_back: false, state: state.banip };
+  },
+  banipSetFeeds: async (cfg: T.BanipFeedsConfig) => {
+    await wait(800, 1500);
+    state.banip.feeds = structuredClone(cfg.feeds);
+    if (cfg.enabled !== undefined) {
+      state.banip.enabled = cfg.enabled;
+      state.banip.running = cfg.enabled;
+    }
+    if (cfg.nft_count !== undefined) state.banip.nft_count = cfg.nft_count;
+    return { status: "applied" as const, rolled_back: false, state: state.banip };
+  },
+  banipInstall: async () => {
+    await wait(1500, 3000);
+    state.banip.installed = true;
+    state.banip.enabled = true;
+    state.banip.running = true;
+    return state.banip;
+  },
+  banipUninstall: async () => {
+    await wait(1500, 3000);
+    state.banip.installed = false;
+    state.banip.running = false;
+    state.banip.enabled = false;
+    return state.banip;
+  },
+  banipStatus: async () => {
+    await wait(100, 250);
+    return {
+      installed: state.banip.installed,
+      enabled: state.banip.enabled,
+      running: state.banip.running,
+      applicable: state.banip.applicable,
+    };
+  },
+  banipDismissRamWarning: async () => {
+    await wait(100, 250);
+    if (state.banip.ram_warning) state.banip.ram_warning.dismissed = true;
+    return state.banip;
+  },
+  banipSearch: async (ip: string) => {
+    await wait(400, 900);
+    const blocked = ["91.198.174.192", "45.135.193.12"];
+    return {
+      ip,
+      found: blocked.includes(ip),
+      sets: blocked.includes(ip) ? ["cinsscore.v4", "debl.v4"] : [],
+    };
+  },
+  banipList: async (list: "allowlist" | "blocklist") => {
+    await wait(100, 250);
+    return { entries: list === "allowlist" ? state.banip.allowlist : state.banip.blocklist };
+  },
+  banipListAdd: async (list: "allowlist" | "blocklist", entry: string) => {
+    await wait(800, 1500);
+    const target = list === "allowlist" ? state.banip.allowlist : state.banip.blocklist;
+    if (!target.includes(entry)) target.push(entry);
+    return { status: "applied" as const, rolled_back: false, state: state.banip };
+  },
+  banipListRemove: async (list: "allowlist" | "blocklist", entry: string) => {
+    await wait(800, 1500);
+    const target = list === "allowlist" ? state.banip.allowlist : state.banip.blocklist;
+    const i = target.indexOf(entry);
+    if (i >= 0) target.splice(i, 1);
+    return { status: "applied" as const, rolled_back: false, state: state.banip };
+  },
+  upnp: () => get(state.upnp),
+  upnpStatus: async () => {
+    await wait(100, 250);
+    return {
+      installed: state.upnp.installed,
+      enabled: state.upnp.enabled,
+      running: state.upnp.running,
+      applicable: state.upnp.applicable,
+    };
+  },
+  upnpAction: async (action: string) => {
+    await wait(800, 1500);
+    if (action === "start" || action === "reload" || action === "restart" || action === "enable") {
+      state.upnp.enabled = true;
+      state.upnp.running = true;
+    } else {
+      state.upnp.running = false;
+      if (action === "disable") state.upnp.enabled = false;
+    }
+    return { status: "applied" as const, rolled_back: false, state: state.upnp };
+  },
+  upnpInstall: async () => {
+    await wait(1500, 3000);
+    state.upnp.installed = true;
+    state.upnp.enabled = false;
+    state.upnp.running = false;
+    return state.upnp;
+  },
+  upnpUninstall: async () => {
+    await wait(1500, 3000);
+    state.upnp.installed = false;
+    state.upnp.running = false;
+    state.upnp.enabled = false;
+    return state.upnp;
+  },
+  upnpRuleAdd: async (rule: T.UpnpRuleConfig) => {
+    await wait(800, 1500);
+    const n = state.upnp.rules.filter((r) => r.section.startsWith("netgrip_upnp_")).length + 1;
+    state.upnp.rules.push({
+      section: `netgrip_upnp_${n}`,
+      action: rule.action,
+      int_addr: rule.int_addr,
+      int_ports: rule.int_ports ?? "",
+      ext_ports: rule.ext_ports ?? "",
+      comment: rule.comment ?? "",
+      managed: true,
+    });
+    return { status: "applied" as const, rolled_back: false, state: state.upnp };
+  },
+  upnpRuleDelete: async (section: string) => {
+    await wait(800, 1500);
+    state.upnp.rules = state.upnp.rules.filter((r) => r.section !== section);
+    return { status: "applied" as const, rolled_back: false, state: state.upnp };
+  },
+  firewall: () => get(state.firewall),
+  addFirewallRule: async (rule) => {
+    const n = state.firewall.rules.filter((r) => r.managed).length + 1;
+    state.firewall.rules.push({ section: `netgrip_fw_${n}`, managed: true, enabled: true, ...rule });
+    return write(state.firewall);
+  },
+  deleteFirewallRule: async (section) => {
+    state.firewall.rules = state.firewall.rules.filter((r) => r.section !== section);
+    return write(state.firewall);
+  },
+  dpi: () => get(D.demoDpi),
+  netifyd: () => get(state.netifyd),
+  setNetifyd: async (enabled) => {
+    state.netifyd.enabled = enabled;
+    state.netifyd.running = enabled;
+    return write(state.netifyd);
+  },
+  dpiApps: () => get({ apps: state.netifyd.apps }),
+  dpiTimeline: () => get(D.demoNetifydTimeline),
+
+  // red local
+  lan: () => get(state.lan),
+  setLan: async (opts) => { Object.assign(state.lan, opts); return write(state.lan); },
+  setDhcp: async (cfg) => { state.lan.dhcp = { ...cfg }; return write(state.lan); },
+  setReservation: async (mac, ip, name, reserved) => {
+    state.lan.reservations = reserved
+      ? [...state.lan.reservations.filter((r) => r.mac !== mac), { mac, ip, name }]
+      : state.lan.reservations.filter((r) => r.mac !== mac);
+    const c = state.clients.find((x) => x.mac === mac);
+    if (c) c.reserved = reserved;
+    return write(state.lan);
+  },
+  clearReservations: async () => {
+    state.lan.reservations = [];
+    state.clients.forEach((c) => { c.reserved = false; });
+    return write(state.lan);
+  },
+  dns: () => get(state.dns),
+  adguardAction: async (action: "start" | "stop") => {
+    await wait(800, 1500);
+    state.dns.adguard_running = action === "start";
+    state.dns.adguard_installed = true;
+    return { status: "applied" as const, rolled_back: false, state: { ...state.dns } };
+  },
+  adguardProtection: async (enable: boolean) => {
+    await wait(1200, 2000);
+    state.dns.adguard_installed = true;
+    state.dns.adguard_running = enable;
+    state.dns.adguard_protection = enable;
+    state.dns.adguard_has_backup = enable;
+    state.dns.adguard_active = enable;
+    state.dns.adguard_dns_port = 5353;
+    state.dns.adguard_credentials = enable ? "managed" : state.dns.adguard_credentials;
+    return { status: "applied" as const, rolled_back: false, state: { ...state.dns } };
+  },
+  adguardCredentials: async () => {
+    await wait(200, 400);
+    return { state: "managed", username: "admin", password: "demo-adguard-pass-42" };
+  },
+  adguardRegeneratePassword: async () => {
+    await wait(600, 1000);
+    state.dns.adguard_credentials = "managed";
+    return { state: "managed", username: "admin", password: "demo-adguard-pass-" + Math.floor(Math.random() * 900 + 100) };
+  },
+  adguardDoh: async (action: "enable" | "disable", upstreams: string[]) => {
+    await wait(1200, 2000);
+    if (action === "enable") {
+      state.dns.doh_enabled = true;
+      state.dns.doh_upstreams = [...upstreams];
+    } else {
+      state.dns.doh_enabled = false;
+      state.dns.doh_upstreams = [];
+    }
+    return { status: "applied" as const, rolled_back: false, state: { ...state.dns } };
+  },
+  setDns: async (opts) => { Object.assign(state.dns, opts); return write(state.dns); },
+  setDnsHost: async (ip, hostname, remove) => {
+    state.dns.hosts = remove
+      ? state.dns.hosts.filter((h) => h.ip !== ip || h.hostname !== hostname)
+      : [...state.dns.hosts, { ip, hostname }];
+    return write(state.dns);
+  },
+  vlans: () => get(state.vlans),
+  setVlan: async () => write(state.vlans),
+  deleteVlan: async () => write(state.vlans),
+  lag: () => get(state.lag),
+  setLag: async (cfg) => {
+    await wait(800, 1500);
+    const existing = state.lag.lags.find((l) => l.name === cfg.name);
+    if (existing) {
+      existing.mode = cfg.mode;
+      state.lag.free_ports = [...existing.slaves, ...state.lag.free_ports].filter(
+        (p) => !cfg.slaves.includes(p),
+      ).sort();
+      existing.slaves = [...cfg.slaves];
+      existing.up = true;
+    } else {
+      state.lag.lags.push({ name: cfg.name, device: "bond-" + cfg.name, mode: cfg.mode, slaves: [...cfg.slaves], up: true });
+      state.lag.free_ports = state.lag.free_ports.filter((p) => !cfg.slaves.includes(p));
+    }
+    return { status: "applied" as const, rolled_back: false, state: state.lag };
+  },
+  deleteLag: async (name) => {
+    await wait(800, 1500);
+    const lag = state.lag.lags.find((l) => l.name === name);
+    state.lag.lags = state.lag.lags.filter((l) => l.name !== name);
+    if (lag) state.lag.free_ports = [...state.lag.free_ports, ...lag.slaves].sort();
+    return { status: "applied" as const, rolled_back: false, state: state.lag };
+  },
+
+  // puertos
+  ethports: () => get({ ports: D.demoEthPorts }),
+  l2clients: () => get(D.demoL2Clients),
+  multiwan: () => get(state.mwan),
+  setMultiwan: async (req) => {
+    const m = state.mwan;
+    m.installed = true;
+    m.mode = req.mode;
+    m.managed = req.mode !== "off";
+    m.running = req.mode !== "off";
+    m.enabled = m.running;
+    m.primary_iface = req.mode === "failover" ? req.primary : undefined;
+    m.sticky = req.mode === "balance" ? req.sticky !== false : false;
+    m.candidates = m.candidates.map((c) => {
+      const pooled = req.mode === "balance" && (req.balance?.[c.name] ?? !c.metered);
+      return {
+        ...c,
+        primary: req.mode === "failover" && c.name === req.primary,
+        balance: pooled,
+        weight: req.weights?.[c.name] ?? 1,
+        track: req.track?.[c.name] ?? c.track,
+        active: req.mode === "failover" ? c.name === req.primary : pooled || c.active,
+      };
+    });
+    return write(state.mwan);
+  },
+  setMultiwanPrimary: async (iface) => {
+    const m = state.mwan;
+    m.primary_iface = iface;
+    m.candidates = m.candidates.map((c) => ({ ...c, primary: c.name === iface, active: c.name === iface }));
+    return write(state.mwan);
+  },
+  portforward: () => get(state.fwd),
+  addFwdRule: async (src_dport, dest_ip, dest_port, proto) => {
+    state.fwd.rules.push({ section: `fwd_${state.fwd.rules.length}`, name: "", src_dport, dest_ip, dest_port, proto });
+    return write(state.fwd);
+  },
+  deleteFwdRule: async (section) => {
+    state.fwd.rules = state.fwd.rules.filter((r) => r.section !== section);
+    return write(state.fwd);
+  },
+  bouncePort: async (iface) => { await wait(800, 1500); return { iface, ok: true }; },
+  blockPort: async (iface, _blocked) => { await wait(800, 1500); return { iface, ok: true }; },
+  switchPorts: () => get(D.demoSwitch),
+  setSwitchPort: async () => write(D.demoSwitch),
+  stp: () => get(D.demoStp),
+  setSTPBridge: async () => { await wait(800, 1500); return { status: "applied" }; },
+  setSTPPort: async () => { await wait(800, 1500); return { status: "applied" }; },
+  physPorts: () => get(D.demoPhysPorts),
+  setPhysPort: async () => { await wait(800, 1500); return { status: "applied" }; },
+  portStats: () => get(D.demoPortStats),
+  switchModes: () => get({ modes: D.demoSwitchModes }),
+  applySwitchMode: async () => { await wait(800, 1500); return { status: "ok" }; },
+  poe: () => get(D.demoPoe),
+  setPoESchedule: async () => { await wait(800, 1500); return { status: "ok", state: D.demoPoe }; },
+  poeWatchdogs: () => get({ watchdogs: D.demoPoeWatchdogs }),
+  setPoEWatchdog: async (cfg) => {
+    await wait(800, 1500);
+    const rest = D.demoPoeWatchdogs.filter((w) => w.config.port !== cfg.port);
+    if (cfg.enabled) {
+      rest.push({ config: { ...cfg }, failures: 0, last_check: "", last_cycle: "", cooling: false });
+    }
+    return { status: "applied" as const, watchdogs: rest };
+  },
+  portTemplates: () => get({ templates: state.portTemplates }),
+  savePortTemplate: async (tpl) => {
+    await wait(800, 1500);
+    state.portTemplates = [...state.portTemplates.filter((p) => p.name !== tpl.name), { ...tpl }];
+    return { status: "ok" };
+  },
+  deletePortTemplate: async (name) => {
+    await wait(800, 1500);
+    state.portTemplates = state.portTemplates.filter((p) => p.name !== name);
+    return { status: "ok" };
+  },
+  applyPortTemplate: async () => { await wait(800, 1500); return { status: "ok" }; },
+  roleProfiles: () => get({ roles: D.demoRoleProfiles }),
+  applyRoleProfile: async () => { await wait(800, 1500); return { status: "ok" }; },
+  usteer: () => get({ aps: D.demoUsteer }),
+  offload: () => get(state.offload),
+  setOffload: async (enabled) => { state.offload.software = enabled; return write(state.offload); },
+  igmp: () => get(state.igmp),
+  setIgmp: async (enabled) => { await wait(800, 1500); state.igmp.enabled = enabled; return { ...state.igmp }; },
+  loops: () => get(D.demoLoops),
+  cableTest: () => get(D.demoCableTest),
+  selftest: () => get(D.demoSelfTest),
+  runDiagnostics: async (test) => {
+    await wait(800, 2000);
+    switch (test) {
+      case "ping": return D.demoPing;
+      case "traceroute": return D.demoTraceroute;
+      case "dns": return D.demoDnsLookup;
+      case "tcp": return D.demoTcp;
+      default: return D.demoPing;
+    }
+  },
+  stormControl: () => get(D.demoStorm),
+  setStormControl: async () => { await wait(800, 1500); return { status: "ok" }; },
+  setStormControlAll: async () => { await wait(800, 1500); return { status: "ok" }; },
+  mirror: () => get(D.demoMirror),
+  // El demo no deduce boca de gestion: el chasis se muestra sin badge.
+  managementPort: () => get({ port: "" }),
+  setMirror: async () => { await wait(800, 1500); return { status: "ok" }; },
+  rateLimit: () => get(D.demoRate),
+  setRateLimit: async () => { await wait(800, 1500); return { status: "ok" }; },
+  setRateLimitAll: async () => { await wait(800, 1500); return { status: "ok" }; },
+  portIsolation: () => get(D.demoPortIsolation),
+  setPortIsolation: async () => { await wait(800, 1500); return { status: "ok" }; },
+  portSecurity: () => get(D.demoPortSecurity),
+  setPortLearning: async () => { await wait(800, 1500); return { status: "ok" }; },
+  setPortStaticMac: async () => { await wait(800, 1500); return { status: "ok" }; },
+  macAcl: () => get(D.demoMacAcl),
+  runBufferbloatTest: async () => {
+    await wait(2500, 4000);
+    return { timestamp: new Date().toISOString(), baseline_ms: 8, loaded_ms: 14, delta_ms: 6, grade: "A", samples_loaded: [12, 14, 11, 13] };
+  },
+  bufferbloatHistory: () => get({ entries: [
+    { ts: Date.now() / 1000 - 86400, baseline_ms: 8, loaded_ms: 90, delta_ms: 82, grade: "C", timestamp: new Date(Date.now() * 1000 - 86400 * 1000).toISOString(), samples_loaded: [12, 14, 11, 13] },
+    { ts: Date.now() / 1000 - 43200, baseline_ms: 8, loaded_ms: 30, delta_ms: 22, grade: "B", timestamp: new Date(Date.now() * 1000 - 43200 * 1000).toISOString(), samples_loaded: [12, 14, 11, 13] },
+    { ts: Date.now() / 1000 - 600, baseline_ms: 8, loaded_ms: 14, delta_ms: 6, grade: "A", timestamp: new Date(Date.now() * 1000 - 600 * 1000).toISOString(), samples_loaded: [12, 14, 11, 13] },
+  ] }),
+  pushConfigGet: () => get({ server_url: "https://netpulse.example.com", router_id: "rt1", token: "" }),
+  pushConfigSet: async () => { await wait(600, 1200); return { status: "saved" }; },
+  pushSnapshot: async () => { await wait(1200, 2000); return { ok: true, snapshot_id: "20260829-210000" }; },
+  setMacAcl: async () => { await wait(800, 1500); return { status: "ok" }; },
+  templates: () => get({ templates: D.demoTemplates }),
+  applyTemplate: async () => { await wait(800, 1500); return { status: "ok" }; },
+
+  // sistema / herramientas
+  updateCheck: () => get(D.demoUpdate),
+  startUpdate: async () => { await wait(800, 1500); return { started: true, reboot_pending: true }; },
+  packages: () => get({ upgradable: state.packages }),
+  optionalPackages: () => get({ packages: state.optionalPkgs }),
+  wizardPackages: async (ids) => {
+    await wait(800, 1500);
+    for (const p of state.optionalPkgs) if (ids.includes(p.id)) p.installed = true;
+    return { job: { phase: "done", total: ids.length, done: ids.length, installed: ids } };
+  },
+  installJob: async () => ({ job: { phase: "done", total: 0, done: 0, installed: [] } }),
+  removePackages: async (ids) => {
+    await wait(800, 1500);
+    const removed: string[] = [];
+    for (const p of state.optionalPkgs) {
+      if (ids.includes(p.id) && p.installed) {
+        p.installed = false;
+        removed.push(p.id);
+      }
+    }
+    return { status: "ok", removed, packages: state.optionalPkgs };
+  },
+  upgradePackage: async (name) => {
+    await wait(800, 1500);
+    state.packages = state.packages.filter((p) => p.name !== name);
+    return { upgradable: state.packages };
+  },
+  selfUpdateCheck: () => get(D.demoSelfUpdate),
+  announcement: () => get({ active: true, announcement: D.demoAnnouncement }),
+  selfUpdateSchedule: () => get({ config: { enabled: true, intervalHours: 168, windowStart: 3, windowEnd: 5 }, state: { lastCheck: Math.floor(Date.now() / 1000) - 3600, lastResult: "up-to-date", lastApply: 0, lastVersion: "" }, status: { phase: "idle", progress: 0, message: "" } }),
+  selfUpdateScheduleSave: async (cfg: { enabled?: boolean; intervalHours?: number; windowStart?: number; windowEnd?: number }) => { await wait(300, 600); return { enabled: cfg.enabled ?? true, intervalHours: cfg.intervalHours ?? 168, windowStart: cfg.windowStart ?? 3, windowEnd: cfg.windowEnd ?? 5 }; },
+  selfUpdateApply: async () => { await wait(800, 1500); return { status: "ok", restarting: false } },
+  selfUpdateStatus: () => get<T.SelfUpdateStatus>({ phase: "idle", progress: 0 }),
+  snapshots: () => get({ snapshots: state.snapshots }),
+  createSnapshot: async () => {
+    await wait(800, 1500);
+    const snap: T.ConfigSnapshot = { id: `demo-${Date.now()}`, timestamp: Math.floor(Date.now() / 1000), configs: 14 };
+    state.snapshots = [snap, ...state.snapshots];
+    state.drift.has_baseline = true;
+    state.drift.snapshot_id = snap.id;
+    state.drift.snapshot_ts = snap.timestamp;
+    state.drift.changes = 0;
+    state.drift.configs = [];
+    return snap;
+  },
+  deleteSnapshot: async (id) => {
+    await wait(400, 800);
+    state.snapshots = state.snapshots.filter((s) => s.id !== id);
+  },
+  snapshotDiff: () => get({ diffs: [] }),
+  rollbackSnapshot: async () => { await wait(800, 1500); return { status: "ok" }; },
+  confirmStatus: async () => get({ pending: false }),
+  confirmKeep: async () => { await wait(300, 600); return { status: "kept" }; },
+  confirmRevert: async () => { await wait(300, 600); return { status: "reverted" }; },
+  drift: () => get(state.drift),
+  access: () => get(state.access),
+  setLuciAccess: async (luci) => { state.access.luci = { ...luci }; return write(state.access); },
+  setSshAccess: async (ssh) => { state.access.ssh = { ...ssh }; return write(state.access); },
+  setPanelSessionTtl: async (minutes) => {
+    await wait(400, 800);
+    state.access.panel.session_ttl = `${minutes}m`;
+    return { status: "ok", panel: state.access.panel };
+  },
+  remoteAccess: () => get(state.remote),
+  setRemoteAccess: async (opts) => { Object.assign(state.remote, opts); return write(state.remote); },
+  httpsState: () => get({
+    has_cert: state.hasCert, enabled: state.panelHttps, serving: state.panelHttps,
+    cert: state.panelCert, router_cert: true,
+    serving_cert: state.panelHttps ? "/etc/netgrip/ssl/cert.pem" : "",
+    serving_source: state.panelHttps ? state.panelCert : "",
+  }),
+  setPanelHttps: async (enabled: boolean, cert?: "panel" | "router" | "custom") => {
+    await wait(800, 1500);
+    if (cert) state.panelCert = cert;
+    if (enabled && state.panelCert === "panel") state.hasCert = true;
+    state.panelHttps = enabled;
+    return { status: enabled ? "enabled" : "disabled", https: enabled, restarting: false };
+  },
+  setPassword: async () => { await wait(800, 1500); },
+  telegramGet: () => get(state.telegram),
+  telegramSet: async (botToken, chatId, enabled) => {
+    await wait(800, 1500);
+    state.telegram = { botToken, chatId, enabled };
+    return { ok: true, botName: "NetGripCasaBot", chatName: "Familia García" };
+  },
+  telegramTest: async () => { await wait(400, 900); return { ok: true } },
+  ntfyGet: () => get(state.ntfy),
+  ntfySet: async (server, topic, token, enabled) => {
+    await wait(800, 1500);
+    state.ntfy = { server, topic, tokenSet: token !== "" || state.ntfy.tokenSet, enabled };
+    return { ok: true };
+  },
+  ntfyTest: async () => { await wait(400, 900); return { ok: true } },
+
+  // netpulse (agente embebido): estado sano y push reciente en la demo
+  netpulse: () => get({
+    ...state.netpulse,
+    phase: "connected",
+    discovery: { foundServer: "https://netpulse.example.com", lastDiscoveryAt: new Date(Date.now() - 60_000).toISOString(), lastEnrollNote: "" },
+    status: { running: true, pushOk: true, lastPush: new Date(Date.now() - 15_000).toISOString(), lastError: "" },
+    standaloneReplacedAt: null,
+  }),
+  setNetPulse: async (cfg) => {
+    await wait(800, 1500);
+    state.netpulse = {
+      enabled: cfg.enabled,
+      configured: cfg.enabled ? true : state.netpulse.configured,
+      server: cfg.server || state.netpulse.server,
+      slug: cfg.slug || state.netpulse.slug,
+    };    return {
+      ...state.netpulse,
+      phase: cfg.enabled ? "connected" : "searching",
+      discovery: { foundServer: cfg.server || state.netpulse.server, lastDiscoveryAt: new Date().toISOString(), lastEnrollNote: "" },
+      status: { running: cfg.enabled, pushOk: cfg.enabled, lastPush: cfg.enabled ? new Date().toISOString() : null, lastError: "" },
+      standaloneReplacedAt: null,
+    };
+  },
+  restartAgent: async () => { await wait(200, 500); return { ok: true }; },
+
+  // mqtt (integración #398): conexión sana en la demo
+  mqtt: () => get({
+    ...state.mqtt,
+    configured: state.mqtt.host !== "",
+    connected: state.mqtt.enabled,
+    last_publish: state.mqtt.enabled ? new Date(Date.now() - 20_000).toISOString() : undefined,
+    version: "v0.72.18",
+  }),
+  setMqtt: async (cfg) => {
+    await wait(500, 900);
+    state.mqtt = {
+      enabled: cfg.enabled,
+      host: cfg.host || state.mqtt.host,
+      port: cfg.port || state.mqtt.port,
+      user: cfg.user ?? state.mqtt.user,
+      node_id: cfg.nodeId || state.mqtt.node_id,
+      interval: cfg.interval || state.mqtt.interval,
+      tls: cfg.tls ?? state.mqtt.tls,
+      tls_insecure: cfg.tlsInsecure ?? state.mqtt.tls_insecure,
+    };
+    return {
+      ...state.mqtt,
+      configured: state.mqtt.host !== "",
+      connected: state.mqtt.enabled,
+      last_publish: state.mqtt.enabled ? new Date().toISOString() : undefined,
+      version: "v0.72.18",
+    };
+  },
+  testMqtt: async (cfg) => {
+    await wait(600, 1200);
+    if (!cfg.host) return { ok: false, error: "host is required" };
+    if (cfg.host.includes("fail")) return { ok: false, error: "connection refused" };
+    return { ok: true };
+  },
+  nftqos: () => get({ ...state.nftqos }),
+  setNftqos: async (limit) => {
+    await wait(800, 1500);
+    const key = limit.mac!;
+    if ((limit.download ?? 0) <= 0 && (limit.upload ?? 0) <= 0) {
+      delete state.nftqos.limits[key];
+    } else {
+      state.nftqos.limits[key] = { ...state.nftqos.limits[key], ...limit } as T.NftQoSLimit;
+    }
+    return { ...state.nftqos };
+  },
+  removeNftqos: async (mac) => {
+    await wait(800, 1500);
+    delete state.nftqos.limits[mac];
+    return { ...state.nftqos };
+  },
+  parental: () => get({ rules: state.parental.rules, ts: Date.now() }),
+  setParental: async (rule) => {
+    await wait(800, 1200);
+    state.parental.rules[rule.mac] = { ...rule };
+    return { rules: state.parental.rules, ts: Date.now() };
+  },
+  deleteParental: async (mac) => {
+    await wait(800, 1200);
+    delete state.parental.rules[mac];
+    return { rules: state.parental.rules, ts: Date.now() };
+  },
+  quotas: () => get({ ...state.quota }),
+  setQuota: async (q) => {
+    await wait(800, 1500);
+    state.quota.quotas[q.mac] = { ...q };
+    const prev = state.quota.usage[q.mac]?.used ?? 0;
+    state.quota.usage[q.mac] = {
+      used: prev,
+      limit: q.limit,
+      remaining: Math.max(0, q.limit - prev),
+      period: q.period,
+      throttled: false,
+      exceeded: prev >= q.limit,
+    };
+    return { ...state.quota };
+  },
+  deleteQuota: async (mac) => {
+    await wait(800, 1500);
+    delete state.quota.quotas[mac];
+    delete state.quota.usage[mac];
+    return { ...state.quota };
+  },
+
+  // wifi
+  wifi: () => get({ interfaces: state.wifi }),
+  wifiSchedule: () => get({ schedules: state.wifischedule }),
+  setWifiSchedule: async (sched) => {
+    const st = state.wifischedule.find((x) => x.section === sched.section);
+    const off = sched.paused || (sched.enabled && sched.days.length > 0);
+    if (st) {
+      st.schedule = sched;
+      st.disabled = off;
+      st.off_by_schedule = off;
+      const w = state.wifi.find((x) => x.section === sched.section);
+      if (w) w.disabled = off;
+    }
+    return write({ schedules: state.wifischedule });
+  },
+  wifiKey: async () => { await wait(80, 200); return { key: "demo-passkey-1234" }; },
+  wifiChan: () => get({ radios: state.wifichan }),
+  setWifiChan: async (edit) => {
+    const r = state.wifichan.find((x) => x.radio === edit.radio);
+    if (r && r.suggestion) {
+      r.channel = edit.channel;
+      r.width = edit.width;
+      r.htmode = `HE${edit.width}`;
+      r.suggestion.channel = edit.channel;
+      r.suggestion.reason = "current_ok";
+    }
+    const w = state.wireless.find((x) => x.name === edit.radio);
+    return write(w ?? state.wireless[0]);
+  },
+  setWifi: async (edit) => {
+    const w = state.wifi.find((x) => x.section === edit.section);
+    if (w) {
+      if (edit.ssid !== undefined) w.ssid = edit.ssid;
+      if (edit.encryption !== undefined) w.encryption = edit.encryption;
+      if (edit.hidden !== undefined) w.hidden = edit.hidden;
+      if (edit.disabled !== undefined) w.disabled = edit.disabled;
+      if (edit.key !== undefined) w.has_key = edit.key.length > 0;
+    }
+    return write(w ?? state.wifi[0]);
+  },
+  setWifiRadio: async (edit) => {
+    const r = state.wireless.find((x) => x.name === edit.radio);
+    if (r) {
+      if (edit.channel !== undefined) r.channel = edit.channel;
+      if (edit.htmode !== undefined) r.htmode = edit.htmode;
+      if (edit.txpower) r.txpower = edit.txpower;
+    }
+    return write(r ?? state.wireless[0]);
+  },
+
+  // almacenamiento
+  storage: () => get(state.storage),
+  setStorageService: async (name, action) => {
+    await wait(800, 1500);
+    const s = state.storage.services.find((x) => x.name === name);
+    if (s) { s.enabled = s.running = action === "enable"; }
+    return { status: "ok" };
+  },
+
+  // flota
+  fleet: () => get({ nodes: state.fleet }),
+  addFleetNode: async (node) => {
+    await wait(800, 1500);
+    state.fleet.push({ id: node.id, name: node.name, address: node.address, reachable: true, current_version: "0.1.2", latest_version: "0.1.2", update_available: false });
+    return { status: "ok" };
+  },
+  deleteFleetNode: async (id) => {
+    await wait(400, 800);
+    state.fleet = state.fleet.filter((n) => n.id !== id);
+    return { status: "ok" };
+  },
+  checkFleetNode: async (id) => {
+    await wait(400, 900);
+    const n = state.fleet.find((x) => x.id === id);
+    if (!n) throw new Error("nodo no encontrado");
+    return n;
+  },
+  checkAllFleet: async () => { await wait(600, 1200); return { nodes: state.fleet }; },
+  discoveredFleet: () => get({ peers: state.discoveredFleet }),
+  adoptFleetPeer: async (peer) => {
+    await wait(800, 1500);
+    state.fleet.push({ id: peer.id, name: peer.name, address: peer.address, reachable: true, current_version: "0.1.2", latest_version: "0.1.2", update_available: false });
+    state.discoveredFleet = state.discoveredFleet.filter((p) => p.id !== peer.id);
+    return { status: "ok" };
+  },
+  updateFleetNode: async (id) => {
+    await wait(800, 1500);
+    const n = state.fleet.find((x) => x.id === id);
+    if (n) { n.current_version = n.latest_version; n.update_available = false; }
+    return { status: "ok" };
+  },
+  fleetDiscoveryConfig: () => get({ enabled: true }),
+  setFleetDiscoveryConfig: async (enabled: boolean) => {
+    await wait(200, 400);
+    return { enabled };
+  },
+  lanServices: () => get(state.lanServices),
+  upsertLanService: async (svc) => {
+    await wait(600, 1200);
+    const id = svc.id || svc.name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "service";
+    const existing = state.lanServices.services.find((s) => s.id === id);
+    if (existing) {
+      Object.assign(existing, svc, { id, ok: true, latency_ms: 8, http_status: 200, resolved_ip: "192.168.8.10", error: undefined });
+    } else {
+      state.lanServices.services.push({ ...svc, id, ok: true, latency_ms: 8, http_status: 200, resolved_ip: "192.168.8.10" });
+    }
+    return { ...state.lanServices };
+  },
+  deleteLanService: async (id) => {
+    await wait(400, 800);
+    state.lanServices.services = state.lanServices.services.filter((s) => s.id !== id);
+  },
+  discoverLanServices: () => get(D.demoLanDiscovery),
+};

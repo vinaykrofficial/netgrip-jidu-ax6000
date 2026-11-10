@@ -1,0 +1,458 @@
+import { useCallback, useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { Ban, CloudOff, Copy, Eye, EyeOff, Pencil, QrCode as QrCodeIcon, Settings2, Wifi as WifiIcon } from "lucide-react";
+import { api } from "../api";
+import type { BlockedClient, GuestProbe, IoTProbe, WifiUI, WirelessRadio } from "../types";
+import {
+  Button, Card, EmptyState,
+  Modal, Pill, Skeleton,
+} from "../components/ui";
+import { IlluWifiWaves } from "../components/ui/illustrations";
+import { QrBox, useWifiQr } from "../components/wifi/qr";
+import { WifiEditModal } from "../components/WifiEditModal";
+import { WifiRadioModal } from "../components/WifiRadioModal";
+import { GuestWifiCard } from "../components/GuestWifiCard";
+import { IotWifiCard } from "../components/IotWifiCard";
+import { WifiScheduleCard } from "../components/wifi/WifiScheduleCard";
+import { WifiChanCard } from "../components/wifi/WifiChanCard";
+
+function fmtWidth(htmode: string): string {
+  const m = htmode.match(/(\d+)/);
+  return m ? `${m[1]} MHz` : htmode;
+}
+
+function oneLine(text: string) {
+  return <span className="block truncate" title={text}>{text}</span>;
+}
+
+export function WifiPage({ iot, onIotChange, guest, onGuestChange }: {
+  iot: IoTProbe | undefined;
+  onIotChange: (p: IoTProbe) => void;
+  guest: GuestProbe | undefined;
+  onGuestChange: (p: GuestProbe) => void;
+}) {
+  const { t } = useTranslation();
+  const [ifaces, setIfaces] = useState<WifiUI[]>();
+  const [radios, setRadios] = useState<WirelessRadio[]>();
+  const [error, setError] = useState(false);
+  const [editing, setEditing] = useState<WifiUI>();
+  const [editingRadio, setEditingRadio] = useState<WirelessRadio>();
+  const [keys, setKeys] = useState<Record<string, string>>({});
+  const [blocked, setBlocked] = useState<BlockedClient[]>([]);
+  const [meta, setMeta] = useState<Record<string, { name: string; device_type: string }>>({});
+  const [qrOpen, setQrOpen] = useState<WifiUI | undefined>();
+  const [blockedOpen, setBlockedOpen] = useState<"2g" | "5g" | undefined>();
+
+  const refreshBlocked = useCallback(async () => {
+    try {
+      const r = await api.blockedClients();
+      setBlocked(r.blocked ?? []);
+    } catch { /* no crítico */ }
+  }, []);
+
+  const load = useCallback(async () => {
+    setError(false);
+    try {
+      const [w, r, m] = await Promise.all([api.wifi(), api.wireless(), api.clientMeta()]);
+      setIfaces(w.interfaces);
+      setRadios(r);
+      setMeta(m.meta ?? {});
+      await refreshBlocked();
+    } catch {
+      setError(true);
+    }
+  }, [refreshBlocked]);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Cargar claves de todas las radios al montar (autenticado).
+  useEffect(() => {
+    if (!ifaces) return;
+    const main = mainIfaces(ifaces, guest, iot);
+    Promise.all(main.map((i) => api.wifiKey(i.section).catch(() => ({ key: "" }))))
+      .then((results) => {
+        const next: Record<string, string> = {};
+        main.forEach((i, idx) => { next[i.section] = results[idx]?.key ?? ""; });
+        setKeys(next);
+      });
+  }, [ifaces, guest, iot]);
+
+  const secondary = [...(guest?.ifaces ?? []), ...(iot?.ifaces ?? [])];
+  const secondarySsids = [guest?.ssid, iot?.ssid].filter(Boolean);
+  const main = (ifaces ?? []).filter((i) => !secondary.includes(i.ifname) && !secondarySsids.includes(i.ssid));
+
+  const saved = (updated: WifiUI, sessionKey?: string) => {
+    setIfaces((prev) => prev?.map((p) => (p.section === updated.section ? updated : p)));
+    if (sessionKey) setKeys((k) => ({ ...k, [updated.section]: sessionKey }));
+    // Un cambio puede afectar a varias bandas (unificar); refresca el estado real.
+    load();
+  };
+
+  return (
+    <div className="flex flex-col gap-[var(--card-gap)]">
+      <Card index={0}>
+        {error ? (
+          <EmptyState
+            small
+            title={t("wifi.loadError")}
+            illustration={<CloudOff size={24} />}
+            action={<Button variant="secondary" size="sm" onClick={load}>{t("common.retry")}</Button>}
+          />
+        ) : !ifaces ? (
+          <div className="space-y-3">
+            <Skeleton className="h-3 w-16" />
+            <Skeleton className="h-40" />
+            <Skeleton className="h-40" />
+          </div>
+        ) : main.length === 0 ? (
+          <EmptyState title={t("wifi.noRadios")} illustration={<IlluWifiWaves size={120} />} />
+        ) : (
+          <div className="flex flex-col gap-[var(--card-gap)]">
+            {(() => {
+              const bySsid = new Map<string, WifiUI[]>();
+              for (const iface of main) {
+                const arr = bySsid.get(iface.ssid) ?? [];
+                arr.push(iface);
+                bySsid.set(iface.ssid, arr);
+              }
+              return [...bySsid.values()].map((group) => {
+                const rep = group[0];
+                const groupRadios = group
+                  .map((g) => radios?.find((r) => r.name === g.radio))
+                  .filter((r): r is WirelessRadio => !!r);
+                return (
+                  <RadioCard
+                    key={rep.section}
+                    iface={rep}
+                    group={group}
+                    radios={groupRadios}
+                    index={1}
+                    passkey={keys[rep.section]}
+                    blocked={blocked.filter((b) => b.type === "wifi" && (b.bands ?? []).includes(rep.band))}
+                    onEdit={() => setEditing(rep)}
+                    onRadio={(r) => setEditingRadio(r)}
+                    onEnlargeQr={() => setQrOpen(rep)}
+                    onManageBlocked={() => setBlockedOpen(rep.band as "2g" | "5g")}
+                  />
+                );
+              });
+            })()}
+          </div>
+        )}
+      </Card>
+
+      <GuestWifiCard probe={guest} mainSsid={main[0]?.ssid} onChange={onGuestChange} />
+      <IotWifiCard probe={iot} mainSsid={main[0]?.ssid} onChange={onIotChange} />
+      <WifiScheduleCard ifaces={main} index={3} />
+      <WifiChanCard index={4} />
+
+      {editing && (
+        <WifiEditModal
+          iface={editing}
+          group={main.filter((i) => i.ssid === editing.ssid)}
+          main={main}
+          onClose={() => setEditing(undefined)}
+          onSaved={saved}
+        />
+      )}
+
+      {editingRadio && (
+        <WifiRadioModal radio={editingRadio} onClose={() => setEditingRadio(undefined)} onSaved={load} />
+      )}
+
+      <QrModal
+        iface={qrOpen}
+        passkey={qrOpen ? keys[qrOpen.section] : undefined}
+        onClose={() => setQrOpen(undefined)}
+      />
+
+      <WifiBlockedModal
+        band={blockedOpen}
+        blocked={blocked.filter((b) => b.type === "wifi" && (b.bands ?? []).includes(blockedOpen ?? ""))}
+        meta={meta}
+        onUnblock={async (mac, band) => {
+          await api.blockClient(mac, "wifi", false, band);
+          await refreshBlocked();
+        }}
+        onClose={() => setBlockedOpen(undefined)}
+      />
+    </div>
+  );
+}
+
+function mainIfaces(ifaces: WifiUI[], guest: GuestProbe | undefined, iot: IoTProbe | undefined): WifiUI[] {
+  const secondary = [...(guest?.ifaces ?? []), ...(iot?.ifaces ?? [])];
+  const secondarySsids = [guest?.ssid, iot?.ssid].filter(Boolean);
+  return ifaces.filter((i) => !secondary.includes(i.ifname) && !secondarySsids.includes(i.ssid));
+}
+
+/* ══════════════ Tarjeta full-width por radio (#168) ══════════════ */
+
+function RadioCard({ iface, group, radios, index, passkey, blocked, onEdit, onRadio, onEnlargeQr, onManageBlocked }: {
+  iface: WifiUI;
+  group: WifiUI[];
+  radios: WirelessRadio[];
+  index: number;
+  passkey?: string;
+  blocked: BlockedClient[];
+  onEdit: () => void;
+  onRadio: (radio: WirelessRadio) => void;
+  onEnlargeQr: () => void;
+  onManageBlocked: () => void;
+}) {
+  const { t } = useTranslation();
+  const band = iface.band === "5g" ? "band5" : "band24";
+  const groupBands = group.map((g) => g.band);
+  const on = group.every((i) => !i.disabled);
+  const clients = group.reduce((n, i) => n + (i.clients?.length ?? 0), 0);
+  const [showKey, setShowKey] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const qr = useWifiQr(iface.ssid, passkey ?? "", iface.encryption, 96);
+
+  const copyKey = async () => {
+    if (!passkey) return;
+    try {
+      await navigator.clipboard.writeText(passkey);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard bloqueado */ }
+  };
+
+  return (
+    <Card
+      variant="subtle"
+      index={index}
+      title={oneLine(iface.ssid)}
+      icon={WifiIcon}
+      iconTone={on ? "teal" : "danger"}
+      help={band}
+      action={
+        <span className="flex items-center gap-2">
+          <Pill tone={on ? "ok" : "muted"}>{on ? t("wifi.broadcasting") : t("wifi.bandOff")}</Pill>
+          <span className="text-caption text-muted">
+            {groupBands && groupBands.length > 1
+              ? groupBands.map((b) => t(b === "5g" ? "wifi.band5" : "wifi.band24")).join(" + ")
+              : t(`wifi.${band}`)}
+          </span>
+        </span>
+      }
+    >
+      <div className="flex flex-col md:flex-row gap-5">
+        {/* Izquierda: info técnica + clave */}
+        <div className="flex-1 min-w-0 space-y-3">
+          {on ? (
+            <>
+              <div className="flex flex-col gap-1 text-small">
+                {group.map((g) => {
+                  const r = radios.find((x) => x.name === g.radio);
+                  const bandName = t(g.band === "5g" ? "wifi.band5" : "wifi.band24");
+                  return (
+                    <span key={g.section} className="text-muted">
+                      <span className="font-medium text-text">{bandName}</span>
+                      {" · "}{t("wifi.channel")} {r?.channel ?? "—"}
+                      {" · "}{t("wifi.width")} {r ? fmtWidth(r.htmode) : "—"}
+                      {" · "}{t("wifi.power")} {r ? `${r.txpower} dBm` : "—"}
+                    </span>
+                  );
+                })}
+              </div>
+              <p className="text-small text-muted">{t("wifi.devices", { count: clients })}</p>
+
+              <div className="flex items-center gap-2">
+                <span className="text-muted text-small shrink-0">{t("wifi.keyLabel")}:</span>
+                {passkey ? (
+                  <>
+                    <span className="font-mono text-small text-text truncate">
+                      {showKey ? passkey : "••••••••"}
+                    </span>
+                    <button type="button" onClick={() => setShowKey((s) => !s)}
+                      title={showKey ? t("wifi.hideKey") : t("wifi.showKey")}
+                      aria-label={showKey ? t("wifi.hideKey") : t("wifi.showKey")}
+                      className="inline-flex h-7 w-7 items-center justify-center rounded-sm text-muted hover:text-text hover:bg-surface-2 ring-focus transition-colors">
+                      {showKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                    </button>
+                    <button type="button" onClick={copyKey}
+                      title={t("wifi.copyKey")}
+                      aria-label={t("wifi.copyKey")}
+                      className="inline-flex h-7 w-7 items-center justify-center rounded-sm text-muted hover:text-text hover:bg-surface-2 ring-focus transition-colors">
+                      <Copy size={14} />
+                    </button>
+                    {copied && <span className="text-caption text-ok">{t("wifi.copied")}</span>}
+                  </>
+                ) : (
+                  <span className="text-caption text-muted">{t("wifi.keyHidden")}</span>
+                )}
+              </div>
+            </>
+          ) : (
+            <p className="text-small text-muted">{t("wifi.bandOffHint")}</p>
+          )}
+
+          <div className="pt-1 flex flex-wrap items-center gap-2">
+            <Button variant="secondary" size="sm" icon={Pencil} onClick={onEdit}>{group.length > 1 ? t("wifi.netSettings") : t("wifi.bandSettings")}</Button>
+            {group.map((g) => {
+              const r = radios.find((x) => x.name === g.radio);
+              if (!r) return null;
+              const bandName = t(g.band === "5g" ? "wifi.band5" : "wifi.band24");
+              return (
+                <Button key={g.section} variant="secondary" size="sm" icon={Settings2} onClick={() => onRadio(r)}>
+                  {group.length > 1 ? t("wifi.radioSettingsFor", { band: bandName }) : t("wifi.radioSettings")}
+                </Button>
+              );
+            })}
+            {blocked.length > 0 && (
+              <button type="button" onClick={onManageBlocked}
+                className="inline-flex items-center gap-1.5 rounded-md border border-border/60 bg-surface px-2.5 py-1 text-small text-muted hover:text-text hover:bg-surface-2 ring-focus transition-colors">
+                <Ban size={13} className="text-danger" aria-hidden="true" />
+                <span>{t("wifi.manageBlocked", { count: blocked.length })}</span>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Derecha: QR (solo si la red emite) */}
+        {on && (
+          <div className="shrink-0 flex flex-col items-center gap-1.5 self-start">
+            {qr ? (
+              <>
+                <button type="button" onClick={onEnlargeQr}
+                  title={t("wifi.enlargeQr")}
+                  aria-label={t("wifi.enlargeQr")}
+                  className="rounded-md ring-focus transition-transform hover:scale-[1.03]">
+                  <QrBox data={qr} size={96} />
+                </button>
+                <p className="text-[10px] text-muted">{t("wifi.scanQr")}</p>
+              </>
+            ) : (
+              <div className="w-[96px] h-[96px] rounded-md border border-dashed border-border-strong flex items-center justify-center text-faint">
+                <QrCodeIcon size={24} aria-hidden="true" />
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+/* ══════════════ Modal de bloqueados por banda (#168) ══════════════ */
+
+function WifiBlockedModal({ band, blocked, meta, onUnblock, onClose }: {
+  band: "2g" | "5g" | undefined;
+  blocked: BlockedClient[];
+  meta: Record<string, { name: string; device_type: string }>;
+  onUnblock: (mac: string, band?: string) => Promise<void> | void;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const [busy, setBusy] = useState<string>();
+  const bandLabel = band ? t(band === "5g" ? "wifi.band5" : "wifi.band24") : "";
+  const nameFor = (mac: string) => meta[mac]?.name;
+
+  const doUnblock = async (mac: string, bandScope?: string) => {
+    setBusy(mac + ":" + (bandScope ?? ""));
+    try {
+      await onUnblock(mac, bandScope);
+    } finally {
+      setBusy(undefined);
+    }
+  };
+
+  return (
+    <Modal open={!!band} onClose={onClose}
+      title={t("wifi.blockedTitle", { band: bandLabel, count: blocked.length })}
+      footer={<Button variant="ghost" onClick={onClose}>{t("common.close")}</Button>}>
+      {blocked.length === 0 ? (
+        <EmptyState small title={t("clients.blockedEmpty")} />
+      ) : (
+        <ul className="flex flex-col divide-y divide-border/60">
+          {blocked.map((b) => {
+            const name = nameFor(b.mac);
+            const thisBusy = busy?.startsWith(b.mac + ":");
+            return (
+              <li key={b.mac} className="flex items-center gap-3 py-2.5">
+                <Ban size={15} className="text-danger shrink-0" aria-hidden="true" />
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-small font-medium">{name ?? <span className="font-mono">{b.mac}</span>}</p>
+                  <div className="flex flex-wrap gap-1 mt-0.5">
+                    {(b.bands ?? []).map((x) => (
+                      <Pill key={x} tone={x === band ? "warn" : "muted"}>{t(x === "5g" ? "wifi.band5" : "wifi.band24")}</Pill>
+                    ))}
+                  </div>
+                </div>
+                <div className="flex flex-col items-end gap-1 shrink-0">
+                  <button type="button" disabled={thisBusy}
+                    onClick={() => doUnblock(b.mac, band)}
+                    className="text-small text-muted hover:text-text ring-focus disabled:opacity-40">
+                    {t("wifi.unblockBand")}
+                  </button>
+                  {(b.bands?.length ?? 0) > 1 && (
+                    <button type="button" disabled={thisBusy}
+                      onClick={() => doUnblock(b.mac)}
+                      className="text-small text-danger hover:underline ring-focus disabled:opacity-40">
+                      {t("clients.unblockAll")}
+                    </button>
+                  )}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </Modal>
+  );
+}
+
+
+/* ══════════════ Modal QR ampliado con clave copiable (#168) ══════════════ */
+
+function QrModal({ iface, passkey, onClose }: {
+  iface: WifiUI | undefined;
+  passkey: string | undefined;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const [showKey, setShowKey] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const qr = useWifiQr(iface?.ssid ?? "", passkey ?? "", iface?.encryption ?? "psk2", 280);
+  const open = !!iface;
+
+  const copyKey = async () => {
+    if (!passkey) return;
+    try {
+      await navigator.clipboard.writeText(passkey);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard bloqueado */ }
+  };
+
+  useEffect(() => { setShowKey(false); setCopied(false); }, [iface?.section]);
+
+  return (
+    <Modal open={open} onClose={onClose} title={iface ? oneLine(iface.ssid) : ""}>
+      <div className="flex flex-col items-center gap-3 py-2">
+        {qr && <QrBox data={qr} size={280} />}
+        <p className="text-small text-muted">{t("wifi.scanQr")}</p>
+        {passkey && (
+          <div className="flex items-center gap-2 rounded-md border border-border/60 px-3 py-2 w-full max-w-sm">
+            <span className="text-muted text-small shrink-0">{t("wifi.keyLabel")}:</span>
+            <span className="font-mono text-small text-text flex-1 min-w-0 truncate">
+              {showKey ? passkey : "••••••••"}
+            </span>
+            <button type="button" onClick={() => setShowKey((s) => !s)}
+              aria-label={showKey ? t("wifi.hideKey") : t("wifi.showKey")}
+              className="inline-flex h-7 w-7 items-center justify-center rounded-sm text-muted hover:text-text hover:bg-surface-2 ring-focus transition-colors">
+              {showKey ? <EyeOff size={14} /> : <Eye size={14} />}
+            </button>
+            <button type="button" onClick={copyKey}
+              aria-label={t("wifi.copyKey")}
+              className="inline-flex h-7 w-7 items-center justify-center rounded-sm text-muted hover:text-text hover:bg-surface-2 ring-focus transition-colors">
+              <Copy size={14} />
+            </button>
+            {copied && <span className="text-caption text-ok">{t("wifi.copied")}</span>}
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}

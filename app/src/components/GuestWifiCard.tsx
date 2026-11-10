@@ -1,0 +1,262 @@
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
+import { Eye, EyeOff, KeyRound, Network, Shuffle, Users, Wifi } from "lucide-react";
+import { api } from "../api";
+import type { GuestProbe } from "../types";
+import { ActionBanner, Banner, Button, Card, Field, Input, KeyValue, Pill, SettingRow, SkeletonRows, Toggle } from "./ui";
+import { QrBox, useWifiQr } from "./wifi/qr";
+import { useActionCycle } from "./wifi/action";
+import { CaptivePortalPanel } from "./wifi/CaptivePortalPanel";
+import { isValidIp } from "./lan/LanConfigCard";
+
+/** Subred invitados mostrada como "red · router · DHCP" a partir de la IP del
+ * router (probe.subnet). La máscara es siempre /24 y el DHCP .100-.249. */
+function guestRange(subnet: string) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(subnet.trim());
+  if (!m) return undefined;
+  const [a, b, c] = m.slice(1);
+  return {
+    network: `${a}.${b}.${c}.0/24`,
+    router: subnet.trim(),
+    dhcp: `${a}.${b}.${c}.100-${a}.${b}.${c}.249`,
+  };
+}
+
+/**
+ * WiFi para visitas (wifi.md §3). SettingRow héroe + datos cuando está activa.
+ * Solo gateway: atenuada con pill explicativa. La clave es write-only: el ojo
+ * y el QR solo funcionan con una clave escrita en esta sesión.
+ */
+export function GuestWifiCard({ probe, mainSsid, onChange }: {
+  probe: GuestProbe | undefined;
+  mainSsid?: string;
+  onChange: (p: GuestProbe) => void;
+}) {
+  const { t } = useTranslation();
+  const { phase, detail, busy, run, clear } = useActionCycle();
+  const [sessionKey, setSessionKey] = useState("");
+  const [showKey, setShowKey] = useState(false);
+  const [setup, setSetup] = useState(false);
+  const [ssid, setSsid] = useState("");
+  const [key, setKey] = useState("");
+  const [changingKey, setChangingKey] = useState(false);
+  const [newKey, setNewKey] = useState("");
+  const [doneMsg, setDoneMsg] = useState<string>();
+  const [subnet, setSubnet] = useState("192.168.10.1");
+  const [isolate, setIsolate] = useState(true);
+
+  const qr = useWifiQr(probe?.ssid ?? "", sessionKey, "sae-mixed", 96);
+
+  const apply = async (enabled: boolean, cfg?: { ssid?: string; key?: string; subnet?: string; isolate?: boolean }, doneText?: string) => {
+    const res = await run(() => api.setGuestwifi({ enabled, ...cfg }));
+    if (res) {
+      onChange(res.state);
+      if (res.status === "applied") {
+        setDoneMsg(doneText ?? (enabled ? t("guest.doneOn") : t("guest.doneOff")));
+        setSetup(false);
+        setChangingKey(false);
+        if (cfg?.key) setSessionKey(cfg.key);
+        setKey("");
+        setNewKey("");
+      }
+    }
+  };
+
+  const flip = (on: boolean) => {
+    if (!probe) return;
+    if (on && !probe.ssid) {
+      // Primera activación: hace falta nombre y clave
+      setSsid(mainSsid ? `${mainSsid}-Invitados` : "");
+      setSetup(true);
+      return;
+    }
+    apply(on, on ? { ssid: probe.ssid, ...(sessionKey ? { key: sessionKey } : {}) } : {});
+  };
+
+  const toggleIsolate = (value: boolean) => {
+    apply(true, { isolate: value }, t("guest.applied"));
+  };
+
+  const generate = () => {
+    const chars = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789";
+    const buf = new Uint32Array(14);
+    crypto.getRandomValues(buf);
+    return Array.from(buf, (n) => chars[n % chars.length]).join("");
+  };
+
+  const readOnly = !!probe?.gl_conflict;
+  const range = probe?.subnet ? guestRange(probe.subnet) : undefined;
+
+  return (
+    <Card index={3} className={`md:col-span-6 ${probe && !probe.gateway ? "opacity-70" : ""}`}>
+      {!probe ? (
+        <SkeletonRows rows={3} />
+      ) : (
+        <>
+          <SettingRow
+            icon={Users}
+            iconTone="teal"
+            title={t("guest.cardTitle")}
+            description={t("guest.desc")}
+            help={t("help.guest.body")}
+            helpTitle={t("help.guest.title")}
+            checked={probe.active}
+            busy={busy}
+            disabled={!probe.gateway || readOnly}
+            onChange={flip}
+            control={!probe.gateway ? (
+              <span className="flex items-center gap-2">
+                <Pill tone="muted">{t("wifi.gatewayOnly")}</Pill>
+                <Toggle checked={false} disabled onChange={() => {}} label={t("guest.cardTitle")} />
+              </span>
+            ) : undefined}
+          />
+
+          {phase && (
+            <div className="mt-2">
+              <ActionBanner
+                phase={phase}
+                text={phase === "done" ? doneMsg : undefined}
+                detail={detail}
+                onDone={clear}
+              />
+            </div>
+          )}
+
+          {probe.gl_conflict && (
+            <div className="mt-2">
+              <Banner tone="warn">{t("guest.conflict")}</Banner>
+            </div>
+          )}
+
+          {probe.gateway && probe.active && !setup && (
+            <div className="mt-3 flex flex-col gap-3">
+              <KeyValue items={[
+                { label: "SSID", value: probe.ssid },
+                {
+                  label: t("guest.keyLabel"),
+                  value: (
+                    <span className="inline-flex items-center gap-1.5">
+                      <span className="font-mono text-small">
+                        {showKey && sessionKey ? sessionKey : "••••••••••"}
+                      </span>
+                      {sessionKey && (
+                        <button type="button" onClick={() => setShowKey((s) => !s)}
+                          className="text-faint hover:text-text ring-focus rounded-sm" aria-label={t("guest.keyLabel")}>
+                          {showKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                        </button>
+                      )}
+                    </span>
+                  ),
+                },
+                { label: t("iot.clients"), value: t("guest.clientsNow", { count: probe.clients }) },
+                ...(range ? [{ label: t("guest.ipRange"), value: t("guest.ipRangeValue", range), mono: true }] : []),
+              ]} />
+
+              <div className="flex items-center justify-between gap-3 py-1">
+                <div className="min-w-0">
+                  <p className="text-body font-medium">{t("guest.apIsolation")}</p>
+                  <p className="text-small text-muted">{t("guest.apIsolationHint")}</p>
+                </div>
+                <Toggle checked={probe.isolate} busy={busy} disabled={readOnly} onChange={toggleIsolate} label={t("guest.apIsolation")} />
+              </div>
+
+              {!readOnly && (
+                changingKey ? (
+                  <div className="flex flex-col gap-2">
+                    <div className="flex gap-2">
+                      <div className="flex-1">
+                        <Input type="password" mono icon={KeyRound} value={newKey} onChange={(e) => setNewKey(e.target.value)}
+                          placeholder={t("wifi.keyMin")} autoComplete="new-password"
+                          error={newKey.length > 0 && newKey.length < 8} />
+                      </div>
+                      <Button variant="secondary" size="sm" icon={Shuffle} className="h-[var(--input-h)]" onClick={() => setNewKey(generate())}>
+                        {t("wifi.generateKey")}
+                      </Button>
+                    </div>
+                    <div className="flex gap-2">
+                      <Button size="sm" loading={busy} disabled={newKey.length < 8}
+                        onClick={() => apply(true, { ssid: probe.ssid, key: newKey }, t("guest.keySaved"))}>
+                        {t("access.save")}
+                      </Button>
+                      <Button variant="ghost" size="sm" onClick={() => { setChangingKey(false); setNewKey(""); }}>
+                        {t("common.cancel")}
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <div>
+                    <Button variant="ghost" size="sm" onClick={() => setChangingKey(true)}>
+                      {t("guest.changeKey")}
+                    </Button>
+                  </div>
+                )
+              )}
+
+              {qr && (
+                <div className="flex flex-col items-center gap-1.5 pt-1">
+                  <QrBox data={qr} size={96} />
+                  <p className="text-caption text-muted">{t("wifi.scanQr")}</p>
+                </div>
+              )}
+            </div>
+          )}
+
+          {probe.gateway && !probe.active && !setup && (
+            <div className="mt-3 flex flex-col gap-3">
+              {range && (
+                <KeyValue items={[{ label: t("guest.ipRange"), value: t("guest.ipRangeValue", range), mono: true }]} />
+              )}
+              <p className="text-small text-muted text-center py-2 px-2">{t("guest.empty")}</p>
+            </div>
+          )}
+
+          {setup && (
+            <div className="mt-3 flex flex-col gap-3">
+              <Input icon={Wifi} value={ssid} onChange={(e) => setSsid(e.target.value)} placeholder="SSID" maxLength={32} />
+              <div className="flex gap-2">
+                <div className="flex-1">
+                  <Input type="password" mono icon={KeyRound} value={key} onChange={(e) => setKey(e.target.value)}
+                    placeholder={t("wifi.keyMin")} autoComplete="new-password"
+                    error={key.length < 8} />
+                </div>
+                <Button variant="secondary" size="sm" icon={Shuffle} className="h-[var(--input-h)]" onClick={() => setKey(generate())}>
+                  {t("wifi.generateKey")}
+                </Button>
+              </div>
+              {key.length < 8 && (
+                <p className="text-caption text-danger -mt-1">{t("guest.keyMinHint")}</p>
+              )}
+              <Field
+                label={t("guest.subnetLabel")}
+                hint={t("guest.subnetHint")}
+                error={subnet.trim() && !isValidIp(subnet) ? t("guest.subnetInvalid") : undefined}
+                mono
+                icon={Network}
+                inputProps={{ value: subnet, onChange: (e) => setSubnet(e.target.value), placeholder: "192.168.10.1", autoComplete: "off" }}
+              />
+              <div className="flex items-center justify-between gap-3 py-1">
+                <div className="min-w-0">
+                  <p className="text-body font-medium">{t("guest.apIsolation")}</p>
+                  <p className="text-small text-muted">{t("guest.apIsolationHint")}</p>
+                </div>
+                <Toggle checked={isolate} onChange={setIsolate} label={t("guest.apIsolation")} />
+              </div>
+              <div className="flex gap-2">
+                <Button size="sm" loading={busy} disabled={!ssid.trim() || key.length < 8 || !isValidIp(subnet)}
+                  onClick={() => apply(true, { ssid, key, subnet: subnet.trim(), isolate })}>
+                  {t("guest.activate")}
+                </Button>
+                <Button variant="ghost" size="sm" onClick={() => setSetup(false)}>
+                  {t("common.cancel")}
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {probe.gateway && <CaptivePortalPanel gateway={probe.gateway} />}
+        </>
+      )}
+    </Card>
+  );
+}

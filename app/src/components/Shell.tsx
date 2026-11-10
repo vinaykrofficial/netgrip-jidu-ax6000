@@ -1,0 +1,566 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import type { LucideIcon } from "lucide-react";
+import { Activity, ArrowLeftRight, Blocks, ChartColumn, ChartPie, Download, EyeOff, Forward, Globe, HardDrive, Info, LayoutDashboard, LogOut, Menu, Network, Radar, Server, Settings, ShieldAlert, ShieldBan, Smartphone, Wifi, Wrench } from "lucide-react";
+import { api, disableDemo, isDemo } from "../api";
+import type { Board, DDNSProbe, DriftProbe, EthPort, FwdProbe, GuestProbe, IoTProbe, IPv6Probe, MultiWanProbe, OVPNProbe, PhysPortsProbe, SelfUpdateCheck, SQMProbe, StorageProbe, SystemInfo, TSProbe, UsteerAP, UpdateCheck, WanStatus, WGProbe, WirelessRadio } from "../types";
+import { useHealthScore } from "../hooks/useHealthScore";
+import { useMode } from "../hooks/useMode";
+import { AnnouncementBanner } from "./AnnouncementBanner";
+import { Banner, Button, Drawer, Pill, StatusDot, ThemeToggle, ToastProvider } from "./ui";
+import { Logo } from "./ui/illustrations";
+import { Overview } from "../pages/Overview";
+import { TrafficPage } from "../pages/Traffic";
+import { CoveragePage } from "../pages/Coverage";
+import { ClientsPage } from "../pages/Clients";
+import { L2ClientsPage } from "../pages/L2Clients";
+import { WifiPage } from "../pages/Wifi";
+import { InternetPage } from "../pages/Internet";
+import { TrafficRulesPage } from "../pages/TrafficRules";
+import { Services } from "../pages/Services";
+import { Ports } from "../pages/Ports";
+import { System } from "../pages/System";
+import { LanPage } from "../pages/Lan";
+import { DiagnosticsPage } from "../pages/Diagnostics";
+import { FleetPage } from "../pages/Fleet";
+import { StoragePage } from "../pages/Storage";
+import { AboutPage } from "../pages/About";
+import { SelfUpdateDialog } from "../components/system/SelfUpdateDialog";
+
+export type Page = "overview" | "internet" | "wan" | "clients" | "coverage" | "wifi" | "lan" | "services" | "traffic" | "trafficrules" | "banip" | "upnp" | "ports" | "forwards" | "tools" | "diagnostics" | "fleet" | "storage" | "system" | "dpi" | "about";
+
+const NAV_ICONS: Record<Page, LucideIcon> = {
+  overview: LayoutDashboard,
+  internet: Globe,
+  wan: Globe,
+  clients: Smartphone,
+  coverage: Radar,
+  wifi: Wifi,
+  lan: Network,
+  services: Blocks,
+  traffic: ChartPie,
+  trafficrules: ShieldAlert,
+  banip: ShieldBan,
+  upnp: ArrowLeftRight,
+  ports: ArrowLeftRight,
+  forwards: Forward,
+  tools: Wrench,
+  diagnostics: Activity,
+  storage: HardDrive,
+  fleet: Server,
+  system: Settings,
+  dpi: ChartColumn,
+  about: Info,
+};
+
+/** Badge de rol en la cabecera del sidebar (#487): colores del mockup de
+ *  rediseño. Solo se pinta cuando useMode confirma el rol (modeReady). */
+const ROLE_BADGE: Record<"router" | "ap" | "switch", { labelKey: string; cls: string; dot: string }> = {
+  router: { labelKey: "nav.role.router", cls: "bg-accent-soft text-accent", dot: "bg-accent" },
+  ap: { labelKey: "nav.role.ap", cls: "bg-success-soft text-success", dot: "bg-success" },
+  switch: { labelKey: "nav.role.switch", cls: "bg-violet-soft text-violet", dot: "bg-violet" },
+};
+
+/** IA de navegación por roles (#487): misma agrupación que el mockup de
+ *  rediseño. "wan", "forwards", "dpi" y "banip" siguen existiendo como
+ *  páginas pero ya no son entradas directas: se componen dentro de
+ *  "internet" (solo gateway). */
+const NAV_GROUPS: { group: string | null; items: Page[] }[] = [
+  { group: null, items: ["overview"] },
+  { group: "nav.group.yourNetwork", items: ["clients", "coverage", "traffic"] },
+  { group: "nav.group.connection", items: ["internet", "wifi", "lan", "ports", "trafficrules"] },
+  { group: "nav.group.services", items: ["services"] },
+  { group: "nav.group.system", items: ["diagnostics", "storage", "fleet", "system", "about"] },
+];
+
+// Deep-linking (#508): cada página es direccionable por hash (`#/clients`).
+// F5 conserva la vista, atrás/adelante del navegador funcionan y la doc y el
+// soporte pueden enlazar a una página concreta ("Puertos y VLANs" =
+// `#/ports`). El hash es la fuente de verdad: navegar escribe el hash y el
+// listener hashchange actualiza el estado (cubre atrás/adelante y enlaces
+// pegados a mano).
+const VALID_PAGES: readonly string[] = NAV_GROUPS.flatMap((g) => g.items);
+
+function pageFromHash(): Page | null {
+  const h = window.location.hash.replace(/^#\/?/, "").split(/[/?]/)[0];
+  return VALID_PAGES.includes(h) ? (h as Page) : null;
+}
+
+function ShellInner({ onLogout }: { onLogout: () => void }) {
+  const { t } = useTranslation();
+  // #508: la página inicial sale del hash si lo hay (deep link / F5).
+  const [page, setPage] = useState<Page>(() => pageFromHash() ?? "overview");
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [board, setBoard] = useState<Board>();
+  const [system, setSystem] = useState<SystemInfo>();
+  const [wan, setWan] = useState<WanStatus>();
+  const [ipv6, setIpv6] = useState<IPv6Probe>();
+  const [update, setUpdate] = useState<UpdateCheck>();
+  const [wg, setWg] = useState<WGProbe>();
+  const [ddns, setDdns] = useState<DDNSProbe>();
+  const [sqm, setSqm] = useState<SQMProbe>();
+  const [ovpn, setOvpn] = useState<OVPNProbe>();
+  const [iot, setIot] = useState<IoTProbe>();
+  const [fwd, setFwd] = useState<FwdProbe>();
+  const [mwan, setMwan] = useState<MultiWanProbe>();
+  const [ts, setTs] = useState<TSProbe>();
+  const [guest, setGuest] = useState<GuestProbe>();
+  const [ethports, setEthports] = useState<EthPort[]>();
+  const [usteerAps, setUsteerAps] = useState<UsteerAP[]>();
+  const [usteerError, setUsteerError] = useState(false);
+  const [selfUpdate, setSelfUpdate] = useState<SelfUpdateCheck>();
+  const [drift, setDrift] = useState<DriftProbe>();
+  const [storage, setStorage] = useState<StorageProbe>();
+  const [wireless, setWireless] = useState<WirelessRadio[]>();
+  // #522: probe de puertos físicos (salud: enlace por debajo de capacidad).
+  const [physports, setPhysports] = useState<PhysPortsProbe>();
+  const [loadError, setLoadError] = useState(false);
+  const [failCount, setFailCount] = useState(0);
+  const [demoBannerDismissed, setDemoBannerDismissed] = useState(false);
+  const [selfUpdateDialogOpen, setSelfUpdateDialogOpen] = useState(false);
+  // #521: desplegable del pie del sidebar con las secciones ocultas por rol.
+  const [hiddenOpen, setHiddenOpen] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoadError(false);
+    try {
+      const [b, s, w, v6] = await Promise.all([
+        api.board(), api.system(), api.wan(), api.ipv6(),
+      ]);
+      setBoard(b); setSystem(s); setWan(w); setIpv6(v6);
+      setFailCount(0);
+    } catch {
+      setLoadError(true);
+      setFailCount((n) => n + 1);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Título de la pestaña (#159): "nombre del router | NetGrip"; antes del
+  // primer dato de board se queda en "NetGrip" (igual que en el login).
+  useEffect(() => {
+    document.title = board?.hostname ? `${board.hostname} | NetGrip` : "NetGrip";
+  }, [board?.hostname]);
+
+  // Error de red §11: reintento automático con backoff (5s, 10s, 30s).
+  useEffect(() => {
+    if (!loadError) return;
+    const delay = [5000, 10000, 30000][Math.min(failCount, 2)];
+    const id = setTimeout(load, delay);
+    return () => clearTimeout(id);
+  }, [loadError, failCount, load]);
+
+  // Slow checks (owut hits the ASU server): load in the background.
+  useEffect(() => {
+    api.updateCheck().then(setUpdate).catch(() => {});
+    api.wireguard().then(setWg).catch(() => {});
+    api.ddns().then(setDdns).catch(() => {});
+    api.sqm().then(setSqm).catch(() => {});
+    api.openvpn().then(setOvpn).catch(() => {});
+    api.iotwifi().then(setIot).catch(() => {});
+    api.portforward().then(setFwd).catch(() => {});
+    api.multiwan().then(setMwan).catch(() => {});
+    api.tailscale().then(setTs).catch(() => {});
+    api.guestwifi().then(setGuest).catch(() => {});
+    api.ethports().then((r) => setEthports(r.ports)).catch(() => {});
+    api.usteer().then((r) => { setUsteerAps(r.aps); setUsteerError(false); }).catch(() => setUsteerError(true));
+    api.selfUpdateCheck().then(setSelfUpdate).catch(() => {});
+    api.drift().then(setDrift).catch(() => {});
+    api.storage().then(setStorage).catch(() => {});
+    api.wireless().then(setWireless).catch(() => {});
+  }, []);
+
+  const { mode, modeReady } = useMode();
+
+  // #522: probe de puertos físicos SOLO cuando el equipo tiene bocas de
+  // switch (ethtool por puerto no es gratis; en un AP/router sin switch no
+  // aplica). En segundo plano, como el resto de checks lentos.
+  useEffect(() => {
+    if (!modeReady || (mode?.port_count ?? 0) === 0) return;
+    api.physPorts().then(setPhysports).catch(() => {});
+  }, [modeReady, mode?.port_count]);
+
+  const health = useHealthScore({ system, wan, drift, mode, wireless, physports });
+
+  // In AP mode the router is not the gateway: hide pages that only apply to
+  // the gateway (LAN config with dnsmasq, port forwarding).
+  // On switches (no WiFi, many ports): hide WiFi and services pages.
+  // Role is first-class (#447): a device with only LAN ports is a managed
+  // switch whatever its port count; hardware_class stays as fallback for
+  // older probes.
+  // Los grupos de área se gobiernan por rol (#447) y hardware: las páginas
+  // de gateway exigen role=router, las de WiFi exigen radios y la de Switch
+  // exige bocas ethernet. El rol llega por useMode (#484): caché en
+  // localStorage para el primer paint + refetch en segundo plano.
+  // Matriz de roles (#484): gateway ve todo; ap ve bocas LAN + radios;
+  // switch solo bocas LAN + opciones de switch: sin Servicios ni Consumo
+  // (DNS blocker, VPN, QoS... nada de eso aplica a un L2 puro), y desde
+  // #518 tampoco Clientes ni Tráfico (sin dnsmasq ni nlbwmon no tienen
+  // fuente de datos).
+  // Hasta que modeReady es falso NADA gateado se pinta: solo overview. Así
+  // las entradas del rol nunca parpadean: o salen cacheadas (recarga) o no
+  // salen hasta que el probe confirma el rol (primera visita).
+  const role = mode?.role ?? (mode?.mode === "ap" ? "ap" : "router");
+  const isRouter = role === "router";
+  const isSwitch = role === "switch";
+  // Fallbacks por campo solo cuando modeReady: si el probe trae un campo
+  // concreto se usa tal cual; si falta (probes antiguos sin role), el
+  // fallback actual aplica solo a ese campo.
+  const hasWifiRadios = mode?.has_wifi ?? true;
+  const hasSwitchPorts = (mode?.port_count ?? 1) > 0;
+  // Cobertura inalámbrica: solo si usteer reporta varios routers activos.
+  const usteerMultiRouter = useMemo(() => {
+    const hosts = new Set<string>();
+    for (const a of usteerAps ?? []) hosts.add(a.hostname || a.bssid);
+    return hosts.size > 1;
+  }, [usteerAps]);
+  // #521: gateOf devuelve la CLAVE del motivo cuando la entrada se oculta
+  // (null = visible). El mismo cálculo alimenta el menú y el desplegable
+  // "N secciones ocultas por este rol" del pie del sidebar, que nombra cada
+  // sección oculta y explica por qué no aplica.
+  const gateOf = (id: Page): string | null => {
+    if (!modeReady) return id === "overview" ? null : "loading";
+    // La línea de salida y todo lo que cuelga de ella (reenvío de puertos,
+    // DPI, banIP) solo aplica a la puerta de enlace.
+    if ((id === "internet" || id === "wan" || id === "forwards" || id === "dpi" || id === "banip" || id === "upnp" || id === "trafficrules") && !isRouter) return "gatewayOnly";
+    // Red local (DHCP/DNS/reservas): sin dnsmasq la página quedaría vacía
+    // (p. ej. un switch gestionado), así que la entrada no se ofrece.
+    if (id === "lan" && !mode?.dnsmasq_on) return "noDnsmasq";
+    if ((id === "wifi" || id === "coverage") && !hasWifiRadios) return "noWifi";
+    // #500: en un AP el detalle de bocas vive en Resumen; la página de
+    // puertos queda para gateway y switch.
+    if (id === "ports" && role === "ap") return "portsAp";
+    if (id === "ports" && !hasSwitchPorts) return "noPorts";
+    if (id === "storage" && !storage?.applicable) return "noStorage";
+    if (id === "coverage" && !usteerMultiRouter) return "coverageSingle";
+    // #500: Servicios solo gateway (en AP solo quedaba AdGuard/mDNS;
+    // el nombre local se movió a Ajustes).
+    if (id === "services" && !isRouter) return "gatewayOnly";
+    // #518/#520: en un switch L2, "Clients" muestra el inventario de la FDB
+    // (L2ClientsPage) en vez de la vista de router. "Traffic" sí queda
+    // oculto: el conteo por cliente/app (nlbwmon) no aplica al forwarding
+    // por hardware y la página quedaría vacía (su CTA apunta a Servicios,
+    // que en switch tampoco se ofrece).
+    if ((id === "traffic") && isSwitch) return "switchL2";
+    return null;
+  };
+  const visible = (id: Page) => gateOf(id) === null;
+  // #521: secciones ocultas por el rol actual (solo con rol confirmado).
+  const hiddenSections = modeReady
+    ? NAV_GROUPS.flatMap((g) => g.items).filter((id) => gateOf(id) !== null && gateOf(id) !== "loading")
+    : [];
+  const activePage = NAV_GROUPS.some((g) => g.items.includes(page)) && visible(page) ? page : "overview";
+
+  // #508: navegar = escribir el hash (la barra de direcciones siempre
+  // refleja la vista y cada navegación entra en el historial). El estado se
+  // actualiza aquí para respuesta inmediata; el listener hashchange cubre
+  // atrás/adelante y enlaces pegados a mano.
+  const navigateTo = useCallback((p: Page) => {
+    setPage(p);
+    const target = `#/${p}`;
+    if (window.location.hash !== target) {
+      window.location.hash = target;
+    }
+  }, []);
+
+  // Atrás/adelante del navegador y deep links escritos a mano.
+  useEffect(() => {
+    const onHash = () => {
+      const p = pageFromHash();
+      if (p) setPage(p);
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  const navigate = useCallback((p: string) => {
+    navigateTo(p as Page);
+    setMenuOpen(false);
+  }, [navigateTo]);
+
+  const navList = (compact: boolean, onPick?: () => void) => (
+    <div className="flex flex-col gap-0.5">
+      {NAV_GROUPS.map((g, gi) => {
+        const items = g.items.filter(visible);
+        // Grupo vacío tras el filtro por rol (p.ej. Router en un AP, o
+        // WiFi y Servicios en un switch): no se pinta la cabecera suelta.
+        if (items.length === 0) return null;
+        return (
+        <div key={g.group ?? "top"} className={gi > 0 ? "mt-4" : ""}>
+          {g.group && !compact && (
+            <p className="text-eyebrow text-faint px-2.5 mb-1">{t(g.group)}</p>
+          )}
+          {g.group && compact && gi > 0 && <div className="mx-2 my-2 border-t border-border" aria-hidden="true" />}
+          {items.map((id) => {
+            const Icon = NAV_ICONS[id];
+            const active = activePage === id;
+            // En un switch la entrada de puertos cambia de nombre y lleva
+            // el número de bocas (#487), como en el mockup de rediseño.
+            const label = id === "ports" && isSwitch ? t("nav.portsSwitch") : t(`nav.${id}`);
+            const portCount = id === "ports" && isSwitch ? mode?.port_count : undefined;
+            return (
+              <button
+                key={id}
+                type="button"
+                title={t(`nav.desc.${id}`)}
+                onClick={() => { navigateTo(id); onPick?.(); }}
+                aria-current={active ? "page" : undefined}
+                className={`relative flex items-center gap-2.5 rounded-md px-2.5 py-2 text-body font-medium text-left w-full
+                  transition-colors duration-[var(--dur-fast)]
+                  ${compact ? "justify-center" : ""}
+                  ${active ? "bg-accent-soft text-accent" : "text-muted hover:text-text hover:bg-surface-2"}`}
+              >
+                {active && (
+                  <span aria-hidden="true" className="absolute left-0 top-1/2 -translate-y-1/2 h-5 w-[3px] rounded-r-full bg-accent" />
+                )}
+                <span className="relative shrink-0">
+                  <Icon size={18} />
+                </span>
+                {!compact && <span className="flex-1 truncate">{label}</span>}
+                {!compact && portCount !== undefined && portCount > 0 && (
+                  <span className="px-1.5 py-0.5 rounded-md bg-accent-soft text-accent text-[10px] font-bold tabular-nums">
+                    {portCount}
+                  </span>
+                )}
+                {!compact && id === "overview" && <StatusDot tone={health.tone} label={t(health.labelKey)} />}
+              </button>
+            );
+          })}
+        </div>
+        );
+      })}
+      {/* #521: pie del menú - las secciones que el rol oculta, nombradas y
+          con su motivo. El menú se encoge por capacidades; esto lo dice en
+          voz alta en vez de dejar al usuario adivinando. */}
+      {!compact && hiddenSections.length > 0 && (
+        <div className="mt-4 border-t border-border pt-2 px-1">
+          <button
+            type="button"
+            onClick={() => setHiddenOpen((v) => !v)}
+            aria-expanded={hiddenOpen}
+            className="flex items-center gap-2 w-full rounded-md px-2 py-1.5 text-caption text-muted hover:text-text transition-colors duration-[var(--dur-fast)]"
+          >
+            <EyeOff size={14} />
+            <span className="flex-1 text-left">{t("nav.hiddenSections", { count: hiddenSections.length })}</span>
+          </button>
+          {hiddenOpen && (
+            <ul className="mt-1 flex flex-col gap-1.5 px-2 pb-1">
+              {hiddenSections.map((id) => (
+                <li key={id} className="text-caption">
+                  <span className="font-medium text-text">{t(`nav.${id}`)}</span>
+                  <span className="block text-muted">{t(`nav.hiddenReason.${gateOf(id)}`)}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+
+  // Bottom bar móvil §7.4: los 3-4 destinos más usados del modo actual + Menú.
+  const bottomItems: Page[] = (
+    isSwitch
+      ? (["overview", "ports", "tools"] as Page[])
+      : !isRouter
+        ? (["overview", "wifi", "ports", "tools"] as Page[])
+        : (["overview", "wifi", "traffic", "tools"] as Page[])
+  ).filter(visible);
+
+  const demo = isDemo();
+  const exitDemo = () => {
+    disableDemo();
+    window.location.reload();
+  };
+
+  const header = (
+    <header className="flex items-center gap-2 mb-4 md:mb-5">
+      {/* móvil: logo + hostname; desktop: título de página */}
+      <div className="flex-1 min-w-0">
+        <div className="md:hidden flex items-center gap-2">
+          <span className="text-accent"><Logo size={22} /></span>
+          <span className="text-body font-semibold truncate">
+            NetGrip <span className="text-muted font-normal font-mono text-small">· {board?.hostname ?? "…"}</span>
+          </span>
+        </div>
+        <div className="hidden md:block">
+          <h1 className="text-h1">{t(`nav.${activePage}`)}</h1>
+          <p className="text-small text-muted mt-0.5">
+            {health.reasons.length === 0 ? t("health.allGood") : t("health.issues", { count: health.reasons.length })}
+          </p>
+        </div>
+      </div>
+      <div className="hidden md:block"><ThemeToggle /></div>
+      <button
+        type="button"
+        onClick={onLogout}
+        title={t("nav.logout")}
+        aria-label={t("nav.logout")}
+        className="inline-flex h-9 w-9 items-center justify-center rounded-md text-muted hover:text-danger hover:bg-surface-2 ring-focus transition-colors"
+      >
+        <LogOut size={18} />
+      </button>
+    </header>
+  );
+
+  const updateBanner = selfUpdate?.available ? (
+    <Banner tone="info" icon={Download} className="mb-4"
+      action={<Button variant="secondary" size="sm" onClick={() => setSelfUpdateDialogOpen(true)}>{t("selfupdate.update")}</Button>}>
+      {t("selfupdate.bannerText", { version: selfUpdate.latest })}
+    </Banner>
+  ) : null;
+
+  const demoBanner = demo && !demoBannerDismissed ? (
+    <Banner tone="warn" className="mb-4" onDismiss={() => setDemoBannerDismissed(true)}
+      action={
+        <span className="flex gap-2 shrink-0">
+          <Button variant="ghost" size="sm" onClick={exitDemo}>{t("demo.realLogin")}</Button>
+          <Button variant="secondary" size="sm" onClick={exitDemo}>{t("demo.exit")}</Button>
+        </span>
+      }>
+      {t("demo.banner")}
+    </Banner>
+  ) : null;
+
+  const pageContent = (
+    <>
+      {loadError && (
+        <Banner tone="danger" className="mb-4"
+          action={<Button variant="secondary" size="sm" onClick={load}>{t("common.retryNow")}</Button>}>
+          {t("error.network")}
+        </Banner>
+      )}
+      {activePage === "overview" && (
+        <Overview
+          board={board} system={system} wan={wan}
+          drift={drift} onDriftChange={setDrift}
+          isSwitch={role === "switch"} health={health} mode={mode}
+          wireless={wireless} ethports={ethports} storage={storage} onNavigate={navigate}
+        />
+      )}
+      {activePage === "traffic" && <TrafficPage onNavigate={navigate} />}
+      {activePage === "clients" && (isSwitch ? <L2ClientsPage /> : <ClientsPage />)}
+      {activePage === "internet" && (
+        <InternetPage mwan={mwan} onMwanChange={setMwan} fwd={fwd} onFwdChange={setFwd} />
+      )}
+      {activePage === "coverage" && <CoveragePage aps={usteerAps} error={usteerError} />}
+      {activePage === "trafficrules" && <TrafficRulesPage />}
+      {activePage === "wifi" && (
+        <WifiPage iot={iot} onIotChange={setIot} guest={guest} onGuestChange={setGuest} />
+      )}
+      {activePage === "lan" && (
+        <LanPage ipv6={ipv6} onIpv6Change={setIpv6} />
+      )}
+      {activePage === "services" && (
+        <Services wg={wg} onWgChange={setWg} ddns={ddns} onDdnsChange={setDdns} sqm={sqm} onSqmChange={setSqm} ovpn={ovpn} onOvpnChange={setOvpn} ts={ts} onTsChange={setTs} apMode={!isRouter} onNavigate={navigate} />
+      )}
+      {activePage === "ports" && (
+        <Ports ethports={ethports ?? []} />
+      )}
+      {activePage === "diagnostics" && <DiagnosticsPage ethports={ethports ?? []} />}
+      {activePage === "fleet" && (
+        <FleetPage />
+      )}
+      {activePage === "storage" && (
+        <StoragePage />
+      )}
+      {activePage === "about" && <AboutPage />}
+      {activePage === "system" && (
+        <System board={board} update={update} onUpdateChange={setUpdate} onLogout={onLogout} />
+      )}
+      <SelfUpdateDialog
+        open={selfUpdateDialogOpen}
+        onClose={() => setSelfUpdateDialogOpen(false)}
+        initialCheck={selfUpdate}
+      />
+    </>
+  );
+
+  return (
+    <div className="min-h-screen">
+      <div className="w-full max-w-[1280px] mx-auto md:flex">
+        {/* Sidebar §7.1: 240px desktop, 64px tablet §7.5, oculta en móvil */}
+        <nav aria-label={t("app.name")} className="hidden md:flex md:flex-col md:w-16 lg:w-60 md:shrink-0 md:min-h-screen border-r border-border bg-surface/40 p-2 lg:p-3 sticky top-0 max-h-screen overflow-y-auto">
+          <div className="flex items-center gap-2 px-1.5 py-2 mb-2">
+            <span className="text-accent shrink-0"><Logo size={26} /></span>
+            <p className="hidden lg:block text-body font-semibold truncate">
+              NetGrip <span className="text-muted font-normal font-mono text-small">· {board?.hostname ?? "…"}</span>
+            </p>
+          </div>
+          {/* Badge de rol (#487): debajo del nombre, solo cuando el rol es
+              fiable (caché o probe confirmado); nunca en la versión compacta. */}
+          {modeReady && (
+            <div className="hidden lg:block px-1.5 pb-2 -mt-1">
+              <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-semibold ${ROLE_BADGE[role].cls}`}>
+                <span aria-hidden="true" className={`h-1.5 w-1.5 rounded-full ${ROLE_BADGE[role].dot}`} />
+                {t(ROLE_BADGE[role].labelKey)}
+              </span>
+            </div>
+          )}
+          <div className="lg:hidden">{navList(true)}</div>
+          <div className="hidden lg:block">{navList(false)}</div>
+        </nav>
+
+        {/* Contenido */}
+        <main className="flex-1 min-w-0 p-4 md:p-6 pb-[calc(84px+env(safe-area-inset-bottom))] md:pb-12">
+          {header}
+          {demoBanner}
+          {updateBanner}
+          <AnnouncementBanner />
+          {pageContent}
+        </main>
+      </div>
+
+      {/* Bottom bar móvil §7.4 */}
+      <nav aria-label={t("nav.menu")} className="md:hidden fixed bottom-0 inset-x-0 z-40 bg-surface border-t border-border flex pb-[env(safe-area-inset-bottom)]">
+        {bottomItems.map((id) => {
+          const Icon = NAV_ICONS[id];
+          const active = activePage === id;
+          return (
+            <button
+              key={id}
+              type="button"
+              onClick={() => navigateTo(id)}
+              aria-current={active ? "page" : undefined}
+              className={`flex-1 relative flex flex-col items-center gap-0.5 py-2 text-[10px] font-medium transition-colors
+                ${active ? "text-accent" : "text-muted"}`}
+            >
+              <span className="relative">
+                <Icon size={22} />
+              </span>
+              {t(`nav.${id}`)}
+            </button>
+          );
+        })}
+        <button
+          type="button"
+          onClick={() => setMenuOpen(true)}
+          aria-expanded={menuOpen}
+          className="flex-1 flex flex-col items-center gap-0.5 py-2 text-[10px] font-medium text-muted"
+        >
+          <Menu size={22} />
+          {t("nav.menu")}
+        </button>
+      </nav>
+
+      {/* Drawer Menú móvil: lista completa agrupada + toggle de tema
+          (idioma y densidad viven en Sistema > Opciones, #158) */}
+      <Drawer open={menuOpen} onClose={() => setMenuOpen(false)} title={t("nav.menu")}>
+        {navList(false, () => setMenuOpen(false))}
+        <div className="mt-5 pt-4 border-t border-border flex items-center justify-between">
+          <ThemeToggle />
+          <Pill tone={health.tone}>{t(health.labelKey)}</Pill>
+        </div>
+      </Drawer>
+    </div>
+  );
+}
+
+export function Shell(props: { onLogout: () => void }) {
+  return (
+    <ToastProvider>
+      <ShellInner {...props} />
+    </ToastProvider>
+  );
+}

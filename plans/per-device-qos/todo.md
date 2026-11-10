@@ -1,0 +1,8 @@
+- [x] Read SQM module and executor snapshot/rollback pattern
+- [x] Read clients page and detail modal
+- [x] Design nftables rules and persistence format
+- [x] Create plan.md for issue #138
+- [x] Implement backend: nftqos probe/set module
+- [x] Implement frontend: client detail bandwidth limit
+- [x] Build, test and validate on rt3
+- [x] Commit, PR, merge, release
