@@ -266,7 +266,7 @@ fun DashboardScreen(
         AlertDialog(
             onDismissRequest = { showRebootDialog = false },
             containerColor = NetGripCardBg,
-            titleColor = TextPrimary,
+            titleContentColor = TextPrimary,
             textContentColor = TextSecondary,
             title = { Text("Reboot Jidu Router?") },
             text = { Text("Are you sure you want to reboot the Jidu AX6000? All connections will temporarily drop.") },

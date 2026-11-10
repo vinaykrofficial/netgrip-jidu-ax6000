@@ -82,13 +82,14 @@ fun WifiScreen(
         }
     }
 
-    selectedSsidForQr?.let { ssid ->
+    val currentSsid = selectedSsidForQr
+    if (currentSsid != null) {
         AlertDialog(
             onDismissRequest = { selectedSsidForQr = null },
             containerColor = NetGripCardBg,
-            titleColor = TextPrimary,
+            titleContentColor = TextPrimary,
             textContentColor = TextSecondary,
-            title = { Text("Share Wi-Fi: $ssid") },
+            title = { Text("Share Wi-Fi: $currentSsid") },
             text = {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text("Scan to connect to this Wi-Fi 6 network:")
@@ -111,7 +112,7 @@ fun WifiScreen(
                     }
                     Spacer(modifier = Modifier.height(12.dp))
                     Text(
-                        text = "SSID: $ssid",
+                        text = "SSID: $currentSsid",
                         fontWeight = FontWeight.Bold,
                         color = TextPrimary
                     )
